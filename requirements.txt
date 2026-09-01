@@ -1,2 +1,4 @@
+
 websockets
+requests
 python-telegram-bot
