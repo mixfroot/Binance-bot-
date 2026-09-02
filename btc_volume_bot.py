@@ -38,7 +38,7 @@ CHAT_ID = "6263967739"
 
 SYMBOL = "btcusdt"
 INTERVAL = "1m"
-WS_URL = f"wss://fstream.binance.com/ws/{SYMBOL}@kline_{INTERVAL}"
+WS_URL = f"wss://fstream.binance.com/market/ws/{SYMBOL}@kline_{INTERVAL}"
 REST_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 WINDOW_SIZE = 60          # rolling number of closed candles used for mean/std
@@ -143,18 +143,28 @@ async def kline_loop(status: dict):
     first_connection = True
     baseline_ready_announced = False
 
-    # Pre-fill from REST so we don't need to wait WINDOW_SIZE minutes live
-    warmup = await asyncio.to_thread(fetch_warmup_volumes_sync)
-    if warmup:
-        volumes.extend(warmup)
-        status["collected"] = len(volumes)
-        log.info("Pre-filled %d/%d candles via REST warmup.", len(volumes), WINDOW_SIZE)
-    else:
-        log.info("REST warmup unavailable, will build baseline live from websocket.")
-
     while True:
         try:
             async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                # Fetch the latest closed candles' volumes FIRST (fresh on every
+                # connect/reconnect), then start listening live. This guarantees
+                # the baseline reflects real closed candles and doesn't drift
+                # after any downtime.
+                warmup = await asyncio.to_thread(fetch_warmup_volumes_sync)
+                if warmup:
+                    volumes.clear()
+                    volumes.extend(warmup)
+                    status["collected"] = len(volumes)
+                    baseline_ready_announced = len(volumes) >= WINDOW_SIZE
+                    log.info("Pre-filled %d/%d candles via REST warmup.", len(volumes), WINDOW_SIZE)
+                else:
+                    await send_alert(
+                        "⚠️ Warmup fetch of last 60 closed candles failed — "
+                        "falling back to building the baseline live from the websocket "
+                        f"(will take up to {WINDOW_SIZE} minutes)."
+                    )
+                    log.error("REST warmup failed, building baseline live.")
+
                 if first_connection:
                     warmup_note = (
                         f"Baseline pre-loaded ({len(volumes)}/{WINDOW_SIZE} candles) — spike detection is active now."
@@ -167,8 +177,6 @@ async def kline_loop(status: dict):
                         f"(trailing {WINDOW_SIZE} candles).\n"
                         f"{warmup_note}"
                     )
-                    if len(volumes) >= WINDOW_SIZE:
-                        baseline_ready_announced = True
                     first_connection = False
                 else:
                     await send_alert("✅ Reconnected successfully to Binance websocket.")
@@ -179,35 +187,35 @@ async def kline_loop(status: dict):
                 async for raw_msg in ws:
                     try:
                         msg = json.loads(raw_msg)
-                    except Exception:
-                        continue
 
-                    k = msg.get("k")
-                    if not k:
-                        continue
+                        k = msg.get("k")
+                        if not k:
+                            continue
 
-                    is_closed = k.get("x", False)
-                    if not is_closed:
-                        continue  # only act on fully closed candles
+                        is_closed = k.get("x", False)
+                        if not is_closed:
+                            continue  # only act on fully closed candles
 
-                    close_time = k["T"]
-                    close_price = float(k["c"])
-                    volume = float(k["v"])
+                        close_time = k["T"]
+                        close_price = float(k["c"])
+                        volume = float(k["v"])  # same field Binance uses for the REST 'volume' column
 
-                    volumes.append(volume)
-                    status["collected"] = len(volumes)
+                        volumes.append(volume)
+                        status["collected"] = len(volumes)
 
-                    if len(volumes) >= WINDOW_SIZE:
-                        if not baseline_ready_announced:
-                            baseline_ready_announced = True
-                            await send_alert(
-                                f"📊 Baseline ready — {WINDOW_SIZE} closed candles collected.\n"
-                                f"Now actively watching for volume spikes."
-                            )
-                            log.info("Baseline ready, spike detection active.")
-                        # use the trailing 60 EXCLUDING current candle as the baseline
-                        baseline = list(volumes)[:-1]
-                        if len(baseline) >= 2:
+                        if len(volumes) >= WINDOW_SIZE:
+                            if not baseline_ready_announced:
+                                baseline_ready_announced = True
+                                await send_alert(
+                                    f"📊 Baseline ready — {WINDOW_SIZE} closed candles collected.\n"
+                                    f"Now actively watching for volume spikes."
+                                )
+                                log.info("Baseline ready, spike detection active.")
+                            # use the trailing 60 EXCLUDING current candle as the baseline
+                            baseline = list(volumes)[:-1]
+                            if len(baseline) < 2:
+                                continue
+
                             mean_v = statistics.mean(baseline)
                             std_v = statistics.stdev(baseline)
                             threshold = mean_v + STD_MULTIPLIER * std_v
@@ -244,11 +252,17 @@ async def kline_loop(status: dict):
                                     ALERT_COOLDOWN_SECONDS,
                                 )
                                 await asyncio.sleep(ALERT_COOLDOWN_SECONDS)
-                    else:
-                        log.info(
-                            "Warming up: %d/%d closed candles collected.",
-                            len(volumes), WINDOW_SIZE,
-                        )
+                        else:
+                            log.info(
+                                "Warming up: %d/%d closed candles collected.",
+                                len(volumes), WINDOW_SIZE,
+                            )
+                    except Exception as inner_e:
+                        # Any failure while processing a single message should not
+                        # kill the whole bot silently — alert, log, and keep going.
+                        log.error("Candle-processing error: %s", inner_e)
+                        await send_alert(f"⚠️ Logic error while processing a candle: {inner_e}")
+                        continue
 
         except asyncio.CancelledError:
             raise
