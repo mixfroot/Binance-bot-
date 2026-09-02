@@ -6,12 +6,15 @@ BTCUSDT.P (Binance USDT-M Futures) 1m volume-spike Telegram bot.
 - On every CLOSED 1m candle, keeps a rolling window of the last 60 closed candles' volumes.
 - If a closed candle's volume > mean + 2*stdev (of the trailing 60), sends a Telegram alert.
 - Auto-reconnects on any error, waiting 6 seconds, and alerts on error + on successful reconnect.
-- Sends a startup alert, and a "still alive" heartbeat every 30 minutes, 24/7.
-- After a spike alert fires, pauses spike-checking for 18 minutes.
+- Sends a startup alert, and a "still alive" heartbeat every 5 minutes, 24/7.
 
 Run:
     pip install websockets requests
     python3 btc_volume_bot.py
+
+For 24/7 use, run it under a process manager (systemd, pm2, tmux/screen, or `nohup ... &`)
+so it restarts if the machine/process dies (the script itself handles websocket-level
+reconnects, but not process crashes / reboots).
 """
 
 import asyncio
@@ -28,6 +31,8 @@ import websockets
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+# Set these as environment variables on Railway (Variables tab) — do NOT
+# hardcode real credentials in code that goes to a public/shared GitHub repo.
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
 
@@ -115,9 +120,17 @@ async def heartbeat_loop(status: dict):
             if collected < WINDOW_SIZE
             else "Baseline ready, monitoring for spikes."
         )
+        last = status.get("last_stats")
+        stats_line = ""
+        if last:
+            stats_line = (
+                f"\nLast closed candle ({last['time']}): vol={last['volume']:.2f} | "
+                f"mean={last['mean']:.2f} | std={last['std']:.2f} | "
+                f"threshold={last['threshold']:.2f} | z={last['z']:.2f}"
+            )
         await send_alert(
             f"✅ Bot alive — {SYMBOL.upper()}.P {INTERVAL} volume watcher still running.\n"
-            f"{progress}\n"
+            f"{progress}{stats_line}\n"
             f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
 
@@ -204,6 +217,15 @@ async def kline_loop(status: dict):
                                 fmt_ts(close_time), volume, mean_v, std_v, threshold,
                             )
 
+                            status["last_stats"] = {
+                                "time": fmt_ts(close_time),
+                                "volume": volume,
+                                "mean": mean_v,
+                                "std": std_v,
+                                "threshold": threshold,
+                                "z": (volume - mean_v) / std_v if std_v > 0 else 0.0,
+                            }
+
                             if std_v > 0 and volume > threshold:
                                 z = (volume - mean_v) / std_v
                                 await send_alert(
@@ -234,6 +256,8 @@ async def kline_loop(status: dict):
             log.error("Websocket error: %s", e)
             await send_alert(f"⚠️ Error: {e}\nRetrying in {RETRY_SECONDS}s...")
             await asyncio.sleep(RETRY_SECONDS)
+            # loop will attempt to reconnect; first_connection stays False
+            # so next successful connect sends "Reconnected successfully"
             continue
 
 
