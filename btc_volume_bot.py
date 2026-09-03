@@ -1,290 +1,215 @@
-#!/usr/bin/env python3
-"""
-BTCUSDT.P (Binance USDT-M Futures) 1m volume-spike Telegram bot.
-
-- Connects to Binance Futures websocket for BTCUSDT 1m klines (no REST/API key needed).
-- On every CLOSED 1m candle, keeps a rolling window of the last 60 closed candles' volumes.
-- If a closed candle's volume > mean + 2*stdev (of the trailing 60), sends a Telegram alert.
-- Auto-reconnects on any error, waiting 6 seconds, and alerts on error + on successful reconnect.
-- Sends a startup alert, and a "still alive" heartbeat every 5 minutes, 24/7.
-
-Run:
-    pip install websockets requests
-    python3 btc_volume_bot.py
-
-For 24/7 use, run it under a process manager (systemd, pm2, tmux/screen, or `nohup ... &`)
-so it restarts if the machine/process dies (the script itself handles websocket-level
-reconnects, but not process crashes / reboots).
-"""
-
 import asyncio
 import json
 import logging
 import os
-import statistics
-from collections import deque
+import traceback
 from datetime import datetime, timezone
 
 import requests
 import websockets
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-# Set these as environment variables on Railway (Variables tab) — do NOT
-# hardcode real credentials in code that goes to a public/shared GitHub repo.
-BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
-CHAT_ID = "6263967739"
+# ==================== CONFIG ====================
+# Put these in environment variables instead of hardcoding them.
+# (You pasted a real token in chat earlier — revoke it via @BotFather and use a new one.)
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6263967739")
 
-SYMBOL = "btcusdt"
+SYMBOL_RAW = "btcusdt.p"    # ".p" (TradingView perpetual notation) is stripped automatically
+SYMBOL = SYMBOL_RAW.lower().replace(".p", "")
 INTERVAL = "1m"
-WS_URL = f"wss://fstream.binance.com/market/ws/{SYMBOL}@kline_{INTERVAL}"
-REST_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 
-WINDOW_SIZE = 60          # rolling number of closed candles used for mean/std
-STD_MULTIPLIER = 2.0      # alert threshold multiplier
-RETRY_SECONDS = 6         # reconnect delay on error
-HEARTBEAT_SECONDS = 30 * 60   # "still alive" interval
-ALERT_COOLDOWN_SECONDS = 18 * 60  # pause spike-checking for this long after firing an alert
+# Binance USDS-M Futures websocket (as of the 2026 base-URL migration).
+# Kline + aggTrade both fall under the "/market" routed path, using stream (query) mode.
+# Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Important-WebSocket-Change-Notice
+STREAM_URL = (
+    f"wss://fstream.binance.com/market/stream"
+    f"?streams={SYMBOL}@kline_{INTERVAL}/{SYMBOL}@aggTrade"
+)
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+RECONNECT_DELAY = 6        # seconds
+HEARTBEAT_SECONDS = 360    # 6 minutes
+VERIFY_CANDLES = 3         # send a status alert for this many candles after each (re)connect,
+                            # win or no-win, so you can confirm data is actually flowing
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("btc-vol-bot")
-
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+log = logging.getLogger("absorption-bot")
 
 
-def send_telegram_sync(text: str) -> None:
-    """Blocking Telegram send, used inside asyncio.to_thread()."""
+# ==================== TELEGRAM ====================
+def _send_telegram_sync(text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        resp = requests.post(
-            TELEGRAM_API,
-            data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            log.error("Telegram send failed (%s): %s", resp.status_code, resp.text)
-    except Exception as e:
-        log.error("Telegram send exception: %s", e)
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
+        if r.status_code != 200:
+            log.error(f"Telegram send failed: {r.status_code} {r.text}")
+    except Exception:
+        log.error(f"Telegram send exception:\n{traceback.format_exc()}")
 
 
-async def send_alert(text: str) -> None:
-    await asyncio.to_thread(send_telegram_sync, text)
+async def send_telegram(text: str):
+    # requests is blocking, so push it to a thread and keep the websocket loop free
+    await asyncio.to_thread(_send_telegram_sync, text)
 
 
-def fmt_ts(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+# ==================== STATE ====================
+class CandleState:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.open_time = None
+        self.buy_vol = 0.0
+        self.sell_vol = 0.0
+
+    def add_trade(self, qty: float, is_buyer_maker: bool):
+        # isBuyerMaker True  -> taker was a SELLER -> counts as sell volume
+        # isBuyerMaker False -> taker was a BUYER  -> counts as buy volume
+        if is_buyer_maker:
+            self.sell_vol += qty
+        else:
+            self.buy_vol += qty
+
+    @property
+    def delta(self):
+        return self.buy_vol - self.sell_vol
 
 
-def fetch_warmup_volumes_sync() -> list:
-    """
-    One-time REST call at startup to pre-fill the rolling volume window with
-    the last WINDOW_SIZE CLOSED candles, so spike detection is active
-    immediately instead of waiting WINDOW_SIZE minutes after every restart.
-    Live data still comes entirely from the websocket after this.
-    """
-    try:
-        resp = requests.get(
-            REST_KLINES_URL,
-            params={
-                "symbol": SYMBOL.upper(),
-                "interval": INTERVAL,
-                "limit": WINDOW_SIZE + 1,  # last one may still be the currently-forming candle
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        closed_candles = data[:-1] if len(data) > WINDOW_SIZE else data
-        volumes = [float(c[5]) for c in closed_candles[-WINDOW_SIZE:]]
-        return volumes
-    except Exception as e:
-        log.error("Warmup REST fetch failed: %s", e)
-        return []
+state = CandleState()
+verify_remaining = 0   # counts down on each closed candle after a (re)connect
 
 
-# ---------------------------------------------------------------------------
-# Heartbeat task
-# ---------------------------------------------------------------------------
-async def heartbeat_loop(status: dict):
+# ==================== HEARTBEAT ====================
+async def heartbeat_task():
     while True:
         await asyncio.sleep(HEARTBEAT_SECONDS)
-        collected = status.get("collected", 0)
-        progress = (
-            f"Baseline: {collected}/{WINDOW_SIZE} candles collected."
-            if collected < WINDOW_SIZE
-            else "Baseline ready, monitoring for spikes."
-        )
-        last = status.get("last_stats")
-        stats_line = ""
-        if last:
-            stats_line = (
-                f"\nLast closed candle ({last['time']}): vol={last['volume']:.2f} | "
-                f"mean={last['mean']:.2f} | std={last['std']:.2f} | "
-                f"threshold={last['threshold']:.2f} | z={last['z']:.2f}"
-            )
-        await send_alert(
-            f"✅ Bot alive — {SYMBOL.upper()}.P {INTERVAL} volume watcher still running.\n"
-            f"{progress}{stats_line}\n"
-            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
-        )
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        await send_telegram(f"\U0001F493 Heartbeat — bot is alive ({now})")
 
 
-# ---------------------------------------------------------------------------
-# Main websocket loop with auto-reconnect
-# ---------------------------------------------------------------------------
-async def kline_loop(status: dict):
-    volumes: deque = deque(maxlen=WINDOW_SIZE)
-    first_connection = True
-    baseline_ready_announced = False
+# ==================== CORE LOGIC ====================
+async def handle_kline(k: dict):
+    global verify_remaining
+
+    open_time = k["t"]
+    is_closed = k["x"]
+
+    # New candle started -> reset accumulator
+    if state.open_time != open_time:
+        state.reset()
+        state.open_time = open_time
+
+    if is_closed:
+        try:
+            open_price = float(k["o"])
+            close_price = float(k["c"])
+            candle_positive = close_price > open_price
+            candle_negative = close_price < open_price
+            delta = state.delta
+
+            is_absorption = (delta < 0 and candle_positive) or (delta > 0 and candle_negative)
+
+            if delta < 0 and candle_positive:
+                await send_telegram(
+                    f"\U0001F7E2\U0001F53B ABSORPTION (buy side)\n"
+                    f"{SYMBOL.upper()} {INTERVAL}\n"
+                    f"Candle closed GREEN while delta was NEGATIVE ({delta:.4f})\n"
+                    f"O:{open_price} C:{close_price}"
+                )
+            elif delta > 0 and candle_negative:
+                await send_telegram(
+                    f"\U0001F534\U0001F53A ABSORPTION (sell side)\n"
+                    f"{SYMBOL.upper()} {INTERVAL}\n"
+                    f"Candle closed RED while delta was POSITIVE ({delta:.4f})\n"
+                    f"O:{open_price} C:{close_price}"
+                )
+            else:
+                log.info(
+                    f"Candle closed. No absorption. delta={delta:.4f} "
+                    f"O:{open_price} C:{close_price}"
+                )
+
+            # First few candles after every (re)connect: report either way, so you
+            # can confirm klines + trades are actually flowing without waiting for
+            # a real absorption signal.
+            if verify_remaining > 0:
+                if not is_absorption:
+                    direction = "GREEN" if candle_positive else ("RED" if candle_negative else "FLAT")
+                    await send_telegram(
+                        f"\U0001F50D Verification candle ({VERIFY_CANDLES - verify_remaining + 1}/{VERIFY_CANDLES})\n"
+                        f"{SYMBOL.upper()} {INTERVAL} closed {direction}, delta={delta:.4f}\n"
+                        f"O:{open_price} C:{close_price}\n"
+                        f"No absorption — this is just confirming data is live."
+                    )
+                verify_remaining -= 1
+
+        except Exception:
+            err = traceback.format_exc()
+            log.error(err)
+            await send_telegram(f"\u26A0\uFE0F Logic error while evaluating candle close:\n{err[-500:]}")
+
+        state.reset()
+
+
+async def process_message(raw: str):
+    try:
+        msg = json.loads(raw)
+        stream = msg.get("stream", "")
+        data = msg.get("data", {})
+
+        if stream.endswith("@kline_" + INTERVAL):
+            await handle_kline(data["k"])
+
+        elif stream.endswith("@aggTrade"):
+            qty = float(data["q"])
+            is_buyer_maker = data["m"]
+            state.add_trade(qty, is_buyer_maker)
+
+    except Exception:
+        err = traceback.format_exc()
+        log.error(err)
+        await send_telegram(f"\u26A0\uFE0F Error processing message:\n{err[-500:]}")
+
+
+# ==================== WEBSOCKET LOOP ====================
+async def run_forever():
+    global verify_remaining
+
+    await send_telegram(
+        f"\U0001F680 Bot started — watching {SYMBOL.upper()} {INTERVAL} candles.\n"
+        f"Will confirm the first {VERIFY_CANDLES} closed candles so you can verify it's working."
+    )
+    first_connect = True
 
     while True:
         try:
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                # Fetch the latest closed candles' volumes FIRST (fresh on every
-                # connect/reconnect), then start listening live. This guarantees
-                # the baseline reflects real closed candles and doesn't drift
-                # after any downtime.
-                warmup = await asyncio.to_thread(fetch_warmup_volumes_sync)
-                if warmup:
-                    volumes.clear()
-                    volumes.extend(warmup)
-                    status["collected"] = len(volumes)
-                    baseline_ready_announced = len(volumes) >= WINDOW_SIZE
-                    log.info("Pre-filled %d/%d candles via REST warmup.", len(volumes), WINDOW_SIZE)
-                else:
-                    await send_alert(
-                        "⚠️ Warmup fetch of last 60 closed candles failed — "
-                        "falling back to building the baseline live from the websocket "
-                        f"(will take up to {WINDOW_SIZE} minutes)."
-                    )
-                    log.error("REST warmup failed, building baseline live.")
+            async with websockets.connect(STREAM_URL, ping_interval=20, ping_timeout=20) as ws:
+                if not first_connect:
+                    await send_telegram("\u2705 Reconnected successfully.")
+                first_connect = False
+                verify_remaining = VERIFY_CANDLES
+                log.info("Connected to Binance websocket.")
 
-                if first_connection:
-                    warmup_note = (
-                        f"Baseline pre-loaded ({len(volumes)}/{WINDOW_SIZE} candles) — spike detection is active now."
-                        if len(volumes) >= WINDOW_SIZE
-                        else f"Building baseline live ({len(volumes)}/{WINDOW_SIZE} candles so far)."
-                    )
-                    await send_alert(
-                        f"🚀 Bot started — watching {SYMBOL.upper()}.P {INTERVAL} candles.\n"
-                        f"Alert rule: closed-candle volume > mean + {STD_MULTIPLIER}×stdev "
-                        f"(trailing {WINDOW_SIZE} candles).\n"
-                        f"{warmup_note}"
-                    )
-                    first_connection = False
-                else:
-                    await send_alert("✅ Reconnected successfully to Binance websocket.")
-                    log.info("Reconnected successfully.")
+                async for raw in ws:
+                    await process_message(raw)
 
-                log.info("Connected to %s", WS_URL)
+        except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
+            log.error(f"Connection lost: {e}")
+            await send_telegram(f"\u274C Websocket disconnected: {e}\nReconnecting in {RECONNECT_DELAY}s...")
 
-                async for raw_msg in ws:
-                    try:
-                        msg = json.loads(raw_msg)
+        except Exception:
+            err = traceback.format_exc()
+            log.error(err)
+            await send_telegram(f"\u26A0\uFE0F Unexpected error:\n{err[-500:]}\nReconnecting in {RECONNECT_DELAY}s...")
 
-                        k = msg.get("k")
-                        if not k:
-                            continue
-
-                        is_closed = k.get("x", False)
-                        if not is_closed:
-                            continue  # only act on fully closed candles
-
-                        close_time = k["T"]
-                        close_price = float(k["c"])
-                        volume = float(k["v"])  # same field Binance uses for the REST 'volume' column
-
-                        volumes.append(volume)
-                        status["collected"] = len(volumes)
-
-                        if len(volumes) >= WINDOW_SIZE:
-                            if not baseline_ready_announced:
-                                baseline_ready_announced = True
-                                await send_alert(
-                                    f"📊 Baseline ready — {WINDOW_SIZE} closed candles collected.\n"
-                                    f"Now actively watching for volume spikes."
-                                )
-                                log.info("Baseline ready, spike detection active.")
-                            # use the trailing 60 EXCLUDING current candle as the baseline
-                            baseline = list(volumes)[:-1]
-                            if len(baseline) < 2:
-                                continue
-
-                            mean_v = statistics.mean(baseline)
-                            std_v = statistics.stdev(baseline)
-                            threshold = mean_v + STD_MULTIPLIER * std_v
-
-                            log.info(
-                                "Closed candle %s | vol=%.3f mean=%.3f std=%.3f thresh=%.3f",
-                                fmt_ts(close_time), volume, mean_v, std_v, threshold,
-                            )
-
-                            status["last_stats"] = {
-                                "time": fmt_ts(close_time),
-                                "volume": volume,
-                                "mean": mean_v,
-                                "std": std_v,
-                                "threshold": threshold,
-                                "z": (volume - mean_v) / std_v if std_v > 0 else 0.0,
-                            }
-
-                            if std_v > 0 and volume > threshold:
-                                z = (volume - mean_v) / std_v
-                                await send_alert(
-                                    "🚨 <b>Volume Spike Alert</b> — BTCUSDT.P 1m\n"
-                                    f"Candle close: {fmt_ts(close_time)}\n"
-                                    f"Close price: {close_price}\n"
-                                    f"Volume: {volume:.3f}\n"
-                                    f"60-candle mean: {mean_v:.3f}\n"
-                                    f"60-candle stdev: {std_v:.3f}\n"
-                                    f"Threshold (mean+{STD_MULTIPLIER}σ): {threshold:.3f}\n"
-                                    f"Z-score: {z:.2f}\n"
-                                    f"Pausing spike checks for {ALERT_COOLDOWN_SECONDS // 60} min."
-                                )
-                                log.info(
-                                    "Spike alert sent, sleeping %d seconds before resuming checks.",
-                                    ALERT_COOLDOWN_SECONDS,
-                                )
-                                await asyncio.sleep(ALERT_COOLDOWN_SECONDS)
-                        else:
-                            log.info(
-                                "Warming up: %d/%d closed candles collected.",
-                                len(volumes), WINDOW_SIZE,
-                            )
-                    except Exception as inner_e:
-                        # Any failure while processing a single message should not
-                        # kill the whole bot silently — alert, log, and keep going.
-                        log.error("Candle-processing error: %s", inner_e)
-                        await send_alert(f"⚠️ Logic error while processing a candle: {inner_e}")
-                        continue
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.error("Websocket error: %s", e)
-            await send_alert(f"⚠️ Error: {e}\nRetrying in {RETRY_SECONDS}s...")
-            await asyncio.sleep(RETRY_SECONDS)
-            # loop will attempt to reconnect; first_connection stays False
-            # so next successful connect sends "Reconnected successfully"
-            continue
+        await asyncio.sleep(RECONNECT_DELAY)
 
 
 async def main():
-    status = {"collected": 0}
-    await asyncio.gather(
-        kline_loop(status),
-        heartbeat_loop(status),
-    )
+    await asyncio.gather(run_forever(), heartbeat_task())
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Stopped by user.")
+    asyncio.run(main())
