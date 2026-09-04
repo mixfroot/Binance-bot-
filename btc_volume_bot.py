@@ -7,8 +7,8 @@ from datetime import datetime
 from websocket import WebSocketApp
 
 # ====================== CONFIG ======================
-BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
-CHAT_ID   = os.environ.get("TG_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
+BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
+CHAT_ID   = "6263967739"
 
 SYMBOL = "BTCUSDT"
 STD_MULTIPLIER = 2.0
