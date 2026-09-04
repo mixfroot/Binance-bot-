@@ -16,8 +16,9 @@ import websockets
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6263967739")
 
-SYMBOL_RAW = "btcusdt.p"    # ".p" (TradingView perpetual notation) is stripped automatically
-SYMBOL = SYMBOL_RAW.lower().replace(".p", "")
+# Comma-separated list, TradingView-style suffixes (".p") stripped automatically.
+SYMBOLS_RAW = os.environ.get("SYMBOLS", "btcusdt.p,seiusdt.p,suiusdt.p,pixelusdt.p")
+SYMBOLS = [s.strip().lower().replace(".p", "") for s in SYMBOLS_RAW.split(",") if s.strip()]
 
 
 def parse_timeframe_to_ms(tf: str) -> int:
@@ -41,15 +42,17 @@ PRECLOSE_LEAD_SECONDS = int(os.environ.get("PRECLOSE_LEAD_SECONDS", "60"))
 # Binance USDS-M Futures websocket (as of the 2026 base-URL migration).
 # Kline + aggTrade both fall under the "/market" routed path, using stream (query) mode.
 # Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Important-WebSocket-Change-Notice
-STREAM_URL = (
-    f"wss://fstream.binance.com/market/stream"
-    f"?streams={SYMBOL}@kline_{INTERVAL}/{SYMBOL}@aggTrade"
-)
+_stream_parts = []
+for _sym in SYMBOLS:
+    _stream_parts.append(f"{_sym}@kline_{INTERVAL}")
+    _stream_parts.append(f"{_sym}@aggTrade")
+
+STREAM_URL = f"wss://fstream.binance.com/market/stream?streams=" + "/".join(_stream_parts)
 
 RECONNECT_DELAY = 6        # seconds
 HEARTBEAT_SECONDS = 360    # 6 minutes
-VERIFY_CANDLES = 3         # send a status alert for this many candles after each (re)connect,
-                            # win or no-win, so you can confirm data is actually flowing
+VERIFY_CANDLES = 3         # send a status alert for this many candles (per symbol) after each
+                            # (re)connect, win or no-win, so you can confirm data is actually flowing
 
 WICK_SHARE_THRESHOLD = 0.50   # >= this share of total buy/sell volume in a region = absorption
 WICK_RATIO_THRESHOLD = 0.50   # region's own (buy-sell)/(buy+sell) ratio threshold
@@ -83,17 +86,17 @@ async def send_telegram(text: str):
 
 
 # ==================== TRADE BUCKETS (timestamp-based, not stream-order-based) ====================
-# Keyed by candle open_time (ms). Each trade is filed into the bucket that matches
+# Keyed by (symbol, candle open_time (ms)). Each trade is filed into the bucket that matches
 # ITS OWN trade timestamp, not "whatever candle we currently think is open." This
 # is what makes attribution correct regardless of message arrival order between
-# the two independent websocket streams.
-candle_buckets = defaultdict(list)          # open_time -> list of (price, qty, is_buyer_maker)
-bucket_created_at = {}                      # open_time -> wall-clock time.time() when first seen
-latest_kline = {}                           # open_time -> most recent kline dict seen (updates live, even before close)
-scheduled_preclose = set()                  # open_time values we've already scheduled a pre-close check for
-pre_alert_state = {}                        # open_time -> "BUY" / "SELL" if a pre-close warning was sent for it
+# the streams, and keeping symbol in the key keeps coins from mixing.
+candle_buckets = defaultdict(list)          # (symbol, open_time) -> list of (price, qty, is_buyer_maker)
+bucket_created_at = {}                      # (symbol, open_time) -> wall-clock time.time() when first seen
+latest_kline = {}                           # (symbol, open_time) -> most recent kline dict seen (updates live, even before close)
+scheduled_preclose = set()                  # (symbol, open_time) values we've already scheduled a pre-close check for
+pre_alert_state = {}                        # (symbol, open_time) -> "BUY" / "SELL" if a pre-close warning was sent for it
 
-verify_remaining = 0   # counts down on each closed candle after a (re)connect
+verify_remaining = defaultdict(lambda: 0)   # symbol -> countdown of closed candles after a (re)connect
 
 
 def trade_open_time(trade_time_ms: int) -> int:
@@ -192,8 +195,9 @@ def evaluate_absorption(trades, open_p, close_p, high_p, low_p):
     return False, None
 
 
-def absorption_label(direction: str) -> str:
-    return "BUY ABSORPTION" if direction == "BUY" else "SHORT ABSORPTION"
+def direction_label(direction: str) -> str:
+    """BUY absorption -> go long, SELL absorption -> go short."""
+    return "long" if direction == "BUY" else "short"
 
 
 # ==================== HEARTBEAT ====================
@@ -209,24 +213,25 @@ async def bucket_cleanup_task():
     while True:
         await asyncio.sleep(60)
         now = time.time()
-        stale = [ot for ot, created in bucket_created_at.items() if now - created > BUCKET_MAX_AGE_SECONDS]
-        for ot in stale:
-            n_trades = len(candle_buckets.get(ot, []))
-            candle_buckets.pop(ot, None)
-            bucket_created_at.pop(ot, None)
-            latest_kline.pop(ot, None)
-            scheduled_preclose.discard(ot)
-            pre_alert_state.pop(ot, None)
-            log.warning(f"Purged stale trade bucket open_time={ot} ({n_trades} trades, never closed).")
+        stale = [key for key, created in bucket_created_at.items() if now - created > BUCKET_MAX_AGE_SECONDS]
+        for key in stale:
+            symbol, open_time = key
+            n_trades = len(candle_buckets.get(key, []))
+            candle_buckets.pop(key, None)
+            bucket_created_at.pop(key, None)
+            latest_kline.pop(key, None)
+            scheduled_preclose.discard(key)
+            pre_alert_state.pop(key, None)
+            log.warning(f"Purged stale trade bucket {symbol} open_time={open_time} ({n_trades} trades, never closed).")
             if n_trades > 0:
                 await send_telegram(
-                    f"\u26A0\uFE0F Purged a stale candle bucket (open_time={ot}, {n_trades} trades) — "
-                    f"never received a matching kline close for it."
+                    f"\u26A0\uFE0F Purged a stale candle bucket ({symbol.upper()}, open_time={open_time}, "
+                    f"{n_trades} trades) — never received a matching kline close for it."
                 )
 
 
 # ==================== PRE-CLOSE CHECK ====================
-async def pre_close_check_task(open_time: int):
+async def pre_close_check_task(symbol: str, open_time: int):
     """
     Fires PRECLOSE_LEAD_SECONDS before this candle is due to close. If the
     absorption logic is already true against the live (not-yet-final) O/H/L/C
@@ -235,17 +240,18 @@ async def pre_close_check_task(open_time: int):
     if INTERVAL_MS <= PRECLOSE_LEAD_SECONDS * 1000:
         return  # timeframe too short for a meaningful early warning
 
+    key = (symbol, open_time)
     close_time_sec = (open_time + INTERVAL_MS) / 1000
     fire_at = close_time_sec - PRECLOSE_LEAD_SECONDS
     delay = fire_at - time.time()
     if delay > 0:
         await asyncio.sleep(delay)
 
-    k = latest_kline.get(open_time)
+    k = latest_kline.get(key)
     if not k or k.get("x"):
         return  # never saw a live update, or it already closed — finalize_candle covers it
 
-    trades = list(candle_buckets.get(open_time, []))
+    trades = list(candle_buckets.get(key, []))
 
     try:
         is_absorption, direction = evaluate_absorption(
@@ -256,22 +262,22 @@ async def pre_close_check_task(open_time: int):
         return
 
     if is_absorption:
-        pre_alert_state[open_time] = direction
-        await send_telegram(f"{SYMBOL.upper()} — possible {absorption_label(direction)} forming")
+        pre_alert_state[key] = direction
+        await send_telegram(f"{symbol.upper()} — possible {direction_label(direction)} forming")
 
 
 # ==================== CORE LOGIC ====================
-async def finalize_candle(open_time: int, k: dict):
+async def finalize_candle(symbol: str, open_time: int, k: dict):
     """Runs after a short grace period so late/out-of-order aggTrades can still land."""
-    global verify_remaining
+    key = (symbol, open_time)
 
     await asyncio.sleep(GRACE_PERIOD_SECONDS)
 
-    trades = candle_buckets.pop(open_time, [])
-    bucket_created_at.pop(open_time, None)
-    latest_kline.pop(open_time, None)
-    scheduled_preclose.discard(open_time)
-    pre_direction = pre_alert_state.pop(open_time, None)
+    trades = candle_buckets.pop(key, [])
+    bucket_created_at.pop(key, None)
+    latest_kline.pop(key, None)
+    scheduled_preclose.discard(key)
+    pre_direction = pre_alert_state.pop(key, None)
 
     try:
         open_price = float(k["o"])
@@ -282,35 +288,36 @@ async def finalize_candle(open_time: int, k: dict):
         is_absorption, direction = evaluate_absorption(trades, open_price, close_price, high_price, low_price)
 
         if is_absorption:
-            await send_telegram(f"{SYMBOL.upper()} — {absorption_label(direction)}")
+            await send_telegram(f"{symbol.upper()} — {direction_label(direction)}")
         elif pre_direction:
             # a pre-close warning was sent for this candle, but it didn't hold at close
-            await send_telegram(f"{SYMBOL.upper()} — possible {absorption_label(pre_direction)} failed at close")
+            await send_telegram(f"{symbol.upper()} — possible {direction_label(pre_direction)} failed at close")
         else:
-            log.info(f"Candle closed. No absorption. O:{open_price} C:{close_price}")
+            log.info(f"[{symbol.upper()}] Candle closed. No absorption. O:{open_price} C:{close_price}")
 
         # First few candles after every (re)connect: report either way, so you
         # can confirm klines + trades are actually flowing without waiting for
         # a real absorption signal.
-        if verify_remaining > 0:
+        if verify_remaining[symbol] > 0:
+            n = VERIFY_CANDLES - verify_remaining[symbol] + 1
             if close_price == open_price:
                 await send_telegram(
-                    f"\U0001F50D Verification candle ({VERIFY_CANDLES - verify_remaining + 1}/{VERIFY_CANDLES})\n"
-                    f"{SYMBOL.upper()} {INTERVAL}: DOJI (O==C=={open_price}) — skipped, data is flowing."
+                    f"\U0001F50D Verification candle ({n}/{VERIFY_CANDLES})\n"
+                    f"{symbol.upper()} {INTERVAL}: DOJI (O==C=={open_price}) — skipped, data is flowing."
                 )
             elif not is_absorption:
-                direction_label = "GREEN" if close_price > open_price else "RED"
+                candle_dir = "GREEN" if close_price > open_price else "RED"
                 await send_telegram(
-                    f"\U0001F50D Verification candle ({VERIFY_CANDLES - verify_remaining + 1}/{VERIFY_CANDLES})\n"
-                    f"{SYMBOL.upper()} {INTERVAL} closed {direction_label} — "
+                    f"\U0001F50D Verification candle ({n}/{VERIFY_CANDLES})\n"
+                    f"{symbol.upper()} {INTERVAL} closed {candle_dir} — "
                     f"no absorption, this is just confirming data is live."
                 )
-            verify_remaining -= 1
+            verify_remaining[symbol] -= 1
 
     except Exception:
         err = traceback.format_exc()
         log.error(err)
-        await send_telegram(f"\u26A0\uFE0F Logic error while evaluating candle close:\n{err[-500:]}")
+        await send_telegram(f"\u26A0\uFE0F Logic error while evaluating {symbol.upper()} candle close:\n{err[-500:]}")
 
 
 async def process_message(raw: str):
@@ -319,17 +326,24 @@ async def process_message(raw: str):
         stream = msg.get("stream", "")
         data = msg.get("data", {})
 
+        # Stream names look like "btcusdt@kline_3m" / "seiusdt@aggTrade" — pull the symbol
+        # out of the stream name itself so each message is routed to the right coin.
+        symbol = stream.split("@")[0]
+        if symbol not in SYMBOLS:
+            return
+
         if stream.endswith("@kline_" + INTERVAL):
             k = data["k"]
             open_time = k["t"]
-            latest_kline[open_time] = k
+            key = (symbol, open_time)
+            latest_kline[key] = k
 
-            if open_time not in scheduled_preclose:
-                scheduled_preclose.add(open_time)
-                asyncio.create_task(pre_close_check_task(open_time))
+            if key not in scheduled_preclose:
+                scheduled_preclose.add(key)
+                asyncio.create_task(pre_close_check_task(symbol, open_time))
 
             if k["x"]:  # candle closed -> schedule finalize after grace period, don't block the loop
-                asyncio.create_task(finalize_candle(open_time, k))
+                asyncio.create_task(finalize_candle(symbol, open_time, k))
 
         elif stream.endswith("@aggTrade"):
             price = float(data["p"])
@@ -337,10 +351,11 @@ async def process_message(raw: str):
             is_buyer_maker = data["m"]
             trade_time_ms = int(data["T"])
             ot = trade_open_time(trade_time_ms)
+            key = (symbol, ot)
 
-            if ot not in bucket_created_at:
-                bucket_created_at[ot] = time.time()
-            candle_buckets[ot].append((price, qty, is_buyer_maker))
+            if key not in bucket_created_at:
+                bucket_created_at[key] = time.time()
+            candle_buckets[key].append((price, qty, is_buyer_maker))
 
     except Exception:
         err = traceback.format_exc()
@@ -350,11 +365,10 @@ async def process_message(raw: str):
 
 # ==================== WEBSOCKET LOOP ====================
 async def run_forever():
-    global verify_remaining
-
+    symbols_str = ", ".join(s.upper() for s in SYMBOLS)
     await send_telegram(
-        f"\U0001F680 Bot started — watching {SYMBOL.upper()} {INTERVAL} candles.\n"
-        f"Will confirm the first {VERIFY_CANDLES} closed candles so you can verify it's working."
+        f"\U0001F680 Bot started — watching {symbols_str} {INTERVAL} candles.\n"
+        f"Will confirm the first {VERIFY_CANDLES} closed candles per coin so you can verify it's working."
     )
     first_connect = True
 
@@ -364,7 +378,8 @@ async def run_forever():
                 if not first_connect:
                     await send_telegram("\u2705 Reconnected successfully.")
                 first_connect = False
-                verify_remaining = VERIFY_CANDLES
+                for sym in SYMBOLS:
+                    verify_remaining[sym] = VERIFY_CANDLES
                 log.info("Connected to Binance websocket.")
 
                 async for raw in ws:
