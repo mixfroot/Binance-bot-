@@ -11,7 +11,7 @@ CHAT_ID   = "6263967739"
 SYMBOLS = ["TUTUSDT", "BTCUSDT", "SEIUSDT", "SUIUSDT"]
 PERIOD = "5m"
 LOOKBACK = 180
-STD_MULTIPLIER = 1.0
+STD_MULTIPLIER = 2.0
 HEARTBEAT_EVERY = 60        # minutes
 CHECK_INTERVAL = 40
 # ====================================================
