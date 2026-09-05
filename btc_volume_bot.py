@@ -12,7 +12,7 @@ CHAT_ID   = "6263967739"
 
 SYMBOL    = "BTCUSDT"
 TIMEFRAME = "1m"       # change freely: 1m, 5m, 15m, 1h, etc.
-LOOKBACK  = 6           # same as "Lookback Length" in the Pine indicator
+LOOKBACK  = 9           # same as "Lookback Length" in the Pine indicator
 PERCENTILE = 50         # 50 = median (matches your script's `median` line)
 HEARTBEAT_SECONDS = 6 * 60   # send an "alive" ping every 6 minutes
 # ====================================================
