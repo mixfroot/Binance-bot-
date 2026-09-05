@@ -1,7 +1,6 @@
 import json
 import time
-import os
-import statistics
+import threading
 import requests
 from datetime import datetime
 from websocket import WebSocketApp
@@ -10,58 +9,32 @@ from websocket import WebSocketApp
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID   = "6263967739"
 
-SYMBOL = "BTCUSDT"
-STD_MULTIPLIER = 2.0
-LOOKBACK = 180
-HEARTBEAT_EVERY = 60          # minutes
-MIN_HISTORY = 30
-
-STATE_FILE = "oi_delta_state.json"
+SYMBOL    = "BTCUSDT"
+TIMEFRAME = "1m"       # change freely: 1m, 5m, 15m, 1h, etc.
+LOOKBACK  = 6           # same as "Lookback Length" in the Pine indicator
+PERCENTILE = 50         # 50 = median (matches your script's `median` line)
+HEARTBEAT_SECONDS = 6 * 60   # send an "alive" ping every 6 minutes
 # ====================================================
 
-delta_history = []
-last_oi = None
-first_sent = False
-last_heartbeat = time.time()
+def _timeframe_to_seconds(tf):
+    unit = tf[-1]
+    value = int(tf[:-1])
+    if unit == "m":
+        return value * 60
+    if unit == "h":
+        return value * 3600
+    if unit == "d":
+        return value * 86400
+    return 60  # fallback
 
-# Tracks the candle open-time of the LAST candle we actually processed.
-# Used to detect + skip a stale/mid-formation candle right after reconnect.
-last_processed_candle_open = None
-just_reconnected = False
+STALE_THRESHOLD_SECONDS = _timeframe_to_seconds(TIMEFRAME) * 2  # no data for 2 candles = stale
 
+closes = []
+previous_median = None
+current_state = None
+last_kline_open_time = None  # de-dupe guard
+last_data_received = None    # timestamp of last processed candle, for stale-feed detection
 
-# ---------------------- persistence ----------------------
-
-def save_state():
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump({
-                "delta_history": delta_history,
-                "last_oi": last_oi,
-                "first_sent": first_sent,
-                "last_processed_candle_open": last_processed_candle_open
-            }, f)
-    except Exception as e:
-        print("State save error:", e)
-
-
-def load_state():
-    global delta_history, last_oi, first_sent, last_processed_candle_open
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE) as f:
-            data = json.load(f)
-        delta_history = data.get("delta_history", [])[-LOOKBACK:]
-        last_oi = data.get("last_oi")
-        first_sent = data.get("first_sent", False)
-        last_processed_candle_open = data.get("last_processed_candle_open")
-        print(f"Loaded state: {len(delta_history)} deltas, last_oi={last_oi}")
-    except Exception as e:
-        print("State load error:", e)
-
-
-# ---------------------- telegram ----------------------
 
 def send_telegram(text):
     try:
@@ -79,139 +52,158 @@ def send_telegram(text):
         print("Telegram error:", e)
 
 
-def get_current_oi():
-    r = requests.get(
-        f"https://fapi.binance.com/fapi/v1/openInterest?symbol={SYMBOL}",
-        timeout=10
-    )
-    r.raise_for_status()
-    return float(r.json()["openInterest"])
+def percentile_linear_interpolation(data, length, percentile):
+    """
+    Replicates Pine Script's ta.percentile_linear_interpolation exactly.
+    Uses the most recent `length` values, sorts them, and linearly
+    interpolates between the two nearest ranks.
+    """
+    if len(data) < length:
+        return None
 
+    window = sorted(data[-length:])
+    n = len(window)
 
-# ---------------------- core logic ----------------------
+    # Pine's rank formula: (percentile / 100) * (n - 1)
+    rank = (percentile / 100) * (n - 1)
+    low_idx = int(rank)
+    high_idx = min(low_idx + 1, n - 1)
+    frac = rank - low_idx
 
-def process_new_oi(current_oi, candle_open_time, candle_close_time):
-    global last_oi, first_sent, delta_history, last_processed_candle_open
+    return window[low_idx] + (window[high_idx] - window[low_idx]) * frac
 
-    now_str = datetime.fromtimestamp(candle_close_time / 1000).strftime("%H:%M")
-
-    if last_oi is None:
-        last_oi = current_oi
-        last_processed_candle_open = candle_open_time
-        save_state()
-        print(f"Initial OI set: {current_oi:,.0f}")
-        return
-
-    delta = current_oi - last_oi
-    last_oi = current_oi
-    last_processed_candle_open = candle_open_time
-
-    delta_history.append(delta)
-    if len(delta_history) > LOOKBACK:
-        delta_history.pop(0)
-
-    save_state()
-
-    print(f"{now_str} | Delta: {delta:,.0f} | History: {len(delta_history)}/{LOOKBACK}")
-
-    if len(delta_history) < MIN_HISTORY:
-        return
-
-    mean = statistics.mean(delta_history)
-    std = statistics.stdev(delta_history) if len(delta_history) > 1 else 0
-    upper = mean + STD_MULTIPLIER * std
-    lower = mean - STD_MULTIPLIER * std
-
-    if not first_sent:
-        msg = (
-            f"✅ <b>{SYMBOL} 1m OI - First Update</b>\n\n"
-            f"Time: {now_str}\n"
-            f"Latest Delta: <b>{delta:,.0f}</b>\n"
-            f"History: {len(delta_history)}/{LOOKBACK}\n"
-            f"Mean: {mean:,.0f} | 2σ: ±{std*2:,.0f}\n\n"
-            f"<i>Now only 2σ alerts will be sent.</i>"
-        )
-        send_telegram(msg)
-        first_sent = True
-        save_state()
-        return
-
-    if delta > upper or delta < lower:
-        direction = "🟢 Positive" if delta > 0 else "🔴 Negative"
-        msg = (
-            f"🚨 <b>{SYMBOL} 1m OI ALERT (2σ)</b>\n\n"
-            f"Time: {now_str}\n"
-            f"1m Delta: <b>{delta:,.0f}</b>\n"
-            f"Mean: {mean:,.0f}\n"
-            f"2σ Range: {lower:,.0f} → {upper:,.0f}\n"
-            f"{direction} extreme move"
-        )
-        send_telegram(msg)
-
-
-# ---------------------- websocket handlers ----------------------
 
 def on_message(ws, message):
-    global last_heartbeat, just_reconnected
+    global previous_median, current_state, closes, last_kline_open_time, last_data_received
 
     try:
         data = json.loads(message)
         k = data.get("k")
         if not k or k.get("x") is not True:
-            return  # only fully closed candles
+            return
 
-        candle_open_time = k["t"]
-        candle_close_time = k["T"]
+        # de-dupe: skip if this candle's open time was already processed
+        open_time = k.get("t")
+        if open_time == last_kline_open_time:
+            return
+        last_kline_open_time = open_time
+        last_data_received = time.time()
 
-        # Right after a reconnect: the very first closed-candle event we get
-        # could be for a candle that was already mid-formation (or already
-        # processed) before the drop. Skip exactly one closed-candle event
-        # after reconnect if it's not strictly newer than the last one we
-        # processed, so we don't double-count or process a stale partial.
-        if just_reconnected:
-            just_reconnected = False
-            if last_processed_candle_open is not None and candle_open_time <= last_processed_candle_open:
-                print(f"Skipping stale post-reconnect candle at {candle_open_time}")
-                return
-            # otherwise it's a genuinely new closed candle -> fine to process
+        close_price = float(k["c"])
+        closes.append(close_price)
 
-        try:
-            current_oi = get_current_oi()
-            process_new_oi(current_oi, candle_open_time, candle_close_time)
-        except Exception as e:
-            send_telegram(f"⚠️ OI fetch error:\n<code>{str(e)}</code>")
+        # keep a small rolling buffer, just enough for the lookback
+        if len(closes) > LOOKBACK + 5:
+            closes = closes[-(LOOKBACK + 5):]
 
-        if time.time() - last_heartbeat > HEARTBEAT_EVERY * 60:
-            send_telegram(
-                f"❤️ Heartbeat\n"
-                f"History: {len(delta_history)}/{LOOKBACK}\n"
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        median = percentile_linear_interpolation(closes, LOOKBACK, PERCENTILE)
+        if median is None:
+            return  # not enough closes yet to fill the lookback window
+
+        if previous_median is None:
+            previous_median = median
+            return
+
+        new_state = None
+        if median > previous_median:
+            new_state = "Uptrend"
+        elif median < previous_median:
+            new_state = "Downtrend"
+        # if median == previous_median: no change, stay silent
+
+        if new_state and new_state != current_state:
+            current_state = new_state
+            emoji = "🟢" if new_state == "Uptrend" else "🔴"
+            time_str = datetime.fromtimestamp(k["T"] / 1000).strftime("%H:%M")
+            msg = (
+                f"{emoji} <b>{SYMBOL} Trend Change</b>\n\n"
+                f"New State: <b>{new_state}</b>\n"
+                f"Timeframe: {TIMEFRAME}\n"
+                f"Time: {time_str}\n"
+                f"Median: {median:.2f}"
             )
-            last_heartbeat = time.time()
+            send_telegram(msg)
+
+        previous_median = median
 
     except Exception as e:
-        print("Message error:", e)
+        send_telegram(f"⚠️ Quantile Bot Error:\n<code>{str(e)}</code>")
 
 
 def on_error(ws, error):
-    send_telegram(f"⚠️ WebSocket error:\n<code>{str(error)}</code>")
+    send_telegram(f"⚠️ Quantile Bot WebSocket error:\n<code>{str(error)}</code>")
 
 
 def on_close(ws, close_status_code, close_msg):
-    global just_reconnected
-    just_reconnected = True
-    send_telegram("🔌 WebSocket closed. Reconnecting in 9 seconds... (forming candle at reconnect will be ignored)")
+    send_telegram("🔌 Quantile Bot stopped / disconnected. Reconnecting in 9 seconds...")
+
+
+def heartbeat_loop():
+    while True:
+        time.sleep(HEARTBEAT_SECONDS)
+
+        if last_data_received is None:
+            send_telegram(f"💓 {SYMBOL} - no candles received yet")
+            continue
+
+        seconds_since_data = time.time() - last_data_received
+        if seconds_since_data > STALE_THRESHOLD_SECONDS:
+            minutes_since = int(seconds_since_data // 60)
+            send_telegram(
+                f"⚠️ <b>{SYMBOL} No data received in {minutes_since}m</b>\n"
+                f"Feed may be stalled - check connection"
+            )
+            continue
+
+        state_str = current_state if current_state else "Waiting for first signal"
+        send_telegram(f"💓 {SYMBOL} State: <b>{state_str}</b>")
+
+
+def validate_symbol():
+    """Check SYMBOL actually exists on Binance USDT-M Futures before connecting."""
+    try:
+        resp = requests.get(
+            "https://fapi.binance.com/fapi/v1/exchangeInfo",
+            timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        valid_symbols = {s["symbol"] for s in data.get("symbols", [])}
+
+        if SYMBOL not in valid_symbols:
+            send_telegram(
+                f"❌ <b>Invalid Symbol</b>\n\n"
+                f"'{SYMBOL}' was not found on Binance Futures.\n"
+                f"Check spelling (e.g. BTCUSDT, ETHUSDT) - bot will not start."
+            )
+            print(f"Invalid symbol: {SYMBOL}. Exiting.")
+            return False
+        return True
+
+    except Exception as e:
+        send_telegram(
+            f"⚠️ Could not verify symbol '{SYMBOL}' (network/API issue):\n"
+            f"<code>{str(e)}</code>\nBot will attempt to start anyway."
+        )
+        return True  # don't block startup just because the check itself failed
 
 
 def on_open(ws):
-    send_telegram(f"🔗 Connected to {SYMBOL} 1m stream")
+    print("Quantile Median Bot connected")
+    send_telegram(
+        f"✅ <b>Quantile Bot Started</b>\n\n"
+        f"Symbol: {SYMBOL}\n"
+        f"Timeframe: {TIMEFRAME}\n"
+        f"Lookback: {LOOKBACK}"
+    )
 
 
 def run_websocket():
+    stream = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@kline_{TIMEFRAME}"
     while True:
         try:
             ws = WebSocketApp(
-                f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@kline_1m",
+                stream,
                 on_open=on_open,
                 on_message=on_message,
                 on_error=on_error,
@@ -219,17 +211,17 @@ def run_websocket():
             )
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
-            send_telegram(f"❌ Crash:\n<code>{str(e)}</code>\nReconnecting in 9s...")
+            send_telegram(f"❌ Quantile Bot Crash:\n<code>{str(e)}</code>\nReconnecting in 9s...")
         time.sleep(9)
 
 
 if __name__ == "__main__":
-    load_state()
-    send_telegram(
-        f"🚀 <b>{SYMBOL} 1m OI Delta Bot Started</b>\n\n"
-        f"• History loaded: {len(delta_history)}/{LOOKBACK}\n"
-        f"• Lookback: {LOOKBACK}\n"
-        f"• Alert: 2σ\n"
-        f"• On reconnect → skips the forming/stale candle, resumes on next fresh close"
-    )
-    run_websocket()
+    print("Quiet Quantile Median Bot started...")
+    if not validate_symbol():
+        exit(1)
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
+    try:
+        run_websocket()
+    except Exception as e:
+        send_telegram(f"💀 <b>Quantile Bot FATAL - process exiting</b>\n<code>{str(e)}</code>")
+        raise
