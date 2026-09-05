@@ -4,3 +4,6 @@ requests
 python-telegram-bot
 aiohttp==3.9.5
 requests==2.32.3
+requests==2.32.3
+websocket-client
+websockets
