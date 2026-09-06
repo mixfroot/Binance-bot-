@@ -1,8 +1,3 @@
-```python
-#!/usr/bin/env python3
-"""
-Binance USDT-M Futures — real-time CVD (rolling window) + fastest possible OI polling
-"""
 
 import asyncio
 import json
