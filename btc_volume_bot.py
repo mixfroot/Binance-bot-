@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+"""
+Binance USDT-M Futures — real-time CVD (rolling window) + fastest possible OI polling
+"""
 
 import asyncio
 import json
@@ -102,16 +106,15 @@ def maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi):
     if ALERT_ON_CONFIRM_ONLY and streak < CONFIRM_TICKS:
         return
 
-    # Only alert on a state CHANGE — not every tick the same state stays confirmed.
     if label == _last_alerted_label:
         return
 
     _last_alerted_label = label
 
     msg = (
-        f"⚡ <b>{SYMBOL}</b> — {label}\n"
+        f"ALERT {SYMBOL} - {label}\n"
         f"CVD ratio (30s): {cvd_ratio:+.2f} (buy {buy_vol:.2f} / sell {sell_vol:.2f})\n"
-        f"OI: {latest_oi:.3f} (Δ{oi_pct:+.3f}%)\n"
+        f"OI: {latest_oi:.3f} (change {oi_pct:+.3f}%)\n"
         f"Confirmed for {streak} ticks"
     )
     asyncio.create_task(send_telegram_alert(msg))
@@ -138,9 +141,9 @@ async def aggtrade_listener():
                     except Exception as e:
                         print(f"[WS] bad message skipped: {e}")
         except (websockets.exceptions.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-            print(f"[WS] disconnected: {e} — reconnecting in {backoff}s")
+            print(f"[WS] disconnected: {e} - reconnecting in {backoff}s")
         except Exception as e:
-            print(f"[WS] unexpected error: {e} — reconnecting in {backoff}s")
+            print(f"[WS] unexpected error: {e} - reconnecting in {backoff}s")
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 30)
 
@@ -170,7 +173,7 @@ async def oi_poller():
                     oi_hist.popleft()
             backoff = 2
         except Exception as e:
-            print(f"[OI] poll error: {e} — backing off {backoff}s")
+            print(f"[OI] poll error: {e} - backing off {backoff}s")
             if session and not session.closed:
                 await session.close()
             session = None
@@ -181,7 +184,7 @@ async def oi_poller():
 
 
 # --------------------------------------------------------------------------
-# Signal: OI drives the alert, no threshold — any change counts.
+# Signal: OI drives the alert, no threshold - any change counts.
 # CVD (30s rolling) is shown as context only, doesn't gate anything.
 # --------------------------------------------------------------------------
 def classify(cvd_ratio, oi_pct):
@@ -195,7 +198,6 @@ def classify(cvd_ratio, oi_pct):
 
 
 async def monitor_loop():
-    global _last_alerted_label
     last_label = None
     streak = 0
     while True:
@@ -216,23 +218,19 @@ async def monitor_loop():
 
             if oi_pct is not None:
                 print(f"{ts_str} | CVD ratio: {cvd_ratio:+.2f} (buy {buy_vol:.2f} / sell {sell_vol:.2f}) | "
-                      f"OI: {latest_oi:.3f} (Δ{oi_pct:+.3f}%) | {label} [{tag}]")
+                      f"OI: {latest_oi:.3f} (change {oi_pct:+.3f}%) | {label} [{tag}]")
                 maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi)
             else:
                 print(f"{ts_str} | CVD ratio: {cvd_ratio:+.2f} | OI: gathering history...")
 
-            # Reset the "already alerted" gate once we drop back to neutral,
-            # so the same direction can alert fresh the next time it re-forms.
-            if label in ("warming up...", "neutral"):
-                _last_alerted_label = None
         except Exception as e:
             print(f"[MONITOR] loop error: {e}")
         await asyncio.sleep(1)
 
 
 async def main():
-    print(f"[BOOT] starting monitor for {SYMBOL} — Telegram alerts -> chat {CHAT_ID}")
-    await send_telegram_alert(f"🟢 CVD/OI monitor started for {SYMBOL}")
+    print(f"[BOOT] starting monitor for {SYMBOL} - Telegram alerts -> chat {CHAT_ID}")
+    await send_telegram_alert(f"Monitor started for {SYMBOL}")
     try:
         await asyncio.gather(
             aggtrade_listener(),
@@ -249,4 +247,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nstopped.")
-```
