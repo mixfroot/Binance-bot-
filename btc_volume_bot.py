@@ -1,3 +1,4 @@
+```python
 #!/usr/bin/env python3
 """
 Binance USDT-M Futures — real-time CVD (rolling window) + fastest possible OI polling
@@ -38,6 +39,7 @@ trades = deque()
 oi_hist = deque()
 
 _http_session = None
+_last_alerted_label = None
 
 
 def now():
@@ -97,11 +99,19 @@ async def send_telegram_alert(text):
 
 
 def maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi):
+    global _last_alerted_label
+
     if label in ("warming up...", "neutral"):
         return
 
     if ALERT_ON_CONFIRM_ONLY and streak < CONFIRM_TICKS:
         return
+
+    # Only alert on a state CHANGE — not every tick the same state stays confirmed.
+    if label == _last_alerted_label:
+        return
+
+    _last_alerted_label = label
 
     msg = (
         f"⚡ <b>{SYMBOL}</b> — {label}\n"
@@ -190,6 +200,7 @@ def classify(cvd_ratio, oi_pct):
 
 
 async def monitor_loop():
+    global _last_alerted_label
     last_label = None
     streak = 0
     while True:
@@ -214,6 +225,11 @@ async def monitor_loop():
                 maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi)
             else:
                 print(f"{ts_str} | CVD ratio: {cvd_ratio:+.2f} | OI: gathering history...")
+
+            # Reset the "already alerted" gate once we drop back to neutral,
+            # so the same direction can alert fresh the next time it re-forms.
+            if label in ("warming up...", "neutral"):
+                _last_alerted_label = None
         except Exception as e:
             print(f"[MONITOR] loop error: {e}")
         await asyncio.sleep(1)
@@ -238,3 +254,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nstopped.")
+```
