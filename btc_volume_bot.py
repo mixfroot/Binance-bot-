@@ -23,7 +23,6 @@ OI_POLL_INTERVAL_SEC = 1.0
 OI_LOOKBACK_SEC = 30
 
 CVD_RATIO_THRESHOLD = 0.15
-OI_PCT_THRESHOLD = 0.05
 CONFIRM_TICKS = 3
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
@@ -106,7 +105,7 @@ def maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi):
 
     msg = (
         f"⚡ <b>{SYMBOL}</b> — {label}\n"
-        f"CVD ratio: {cvd_ratio:+.2f} (buy {buy_vol:.2f} / sell {sell_vol:.2f})\n"
+        f"CVD ratio (30s): {cvd_ratio:+.2f} (buy {buy_vol:.2f} / sell {sell_vol:.2f})\n"
         f"OI: {latest_oi:.3f} (Δ{oi_pct:+.3f}%)\n"
         f"Confirmed for {streak} ticks"
     )
@@ -177,27 +176,17 @@ async def oi_poller():
 
 
 # --------------------------------------------------------------------------
-# Signal: OI and CVD independent — either can fire on its own
+# Signal: OI drives the alert, no threshold — any change counts.
+# CVD (30s rolling) is shown as context only, doesn't gate anything.
 # --------------------------------------------------------------------------
 def classify(cvd_ratio, oi_pct):
-    labels = []
-
-    if oi_pct is not None:
-        if oi_pct >= OI_PCT_THRESHOLD:
-            labels.append("OI RISING")
-        elif oi_pct <= -OI_PCT_THRESHOLD:
-            labels.append("OI FALLING")
-
-    if cvd_ratio is not None:
-        if cvd_ratio > CVD_RATIO_THRESHOLD:
-            labels.append("CVD BUY SKEW")
-        elif cvd_ratio < -CVD_RATIO_THRESHOLD:
-            labels.append("CVD SELL SKEW")
-
-    if not labels:
-        return "neutral" if oi_pct is not None else "warming up..."
-
-    return " + ".join(labels)
+    if oi_pct is None:
+        return "warming up..."
+    if oi_pct > 0:
+        return "OI RISING"
+    if oi_pct < 0:
+        return "OI FALLING"
+    return "neutral"
 
 
 async def monitor_loop():
