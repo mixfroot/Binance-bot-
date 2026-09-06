@@ -1,9 +1,9 @@
+```python
 #!/usr/bin/env python3
 """
 Binance USDT-M Futures
 - CVD + OI → LONG/SHORT BUILDING/COVER (very short alerts)
-- OBI top 12 levels → alert at ±0.60
-- 6-second Time-Weighted Average OBI → alert on flip positive/negative
+- 6-second Time-Weighted Average OBI → OBI 🟢 / OBI 🔴
 """
 
 import asyncio
@@ -19,9 +19,8 @@ import websockets
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
 
-# Latest correct endpoints
 WS_AGGTRADE = f"wss://fstream.binance.com/market/ws/{SYMBOL.lower()}@aggTrade"
-WS_DEPTH    = f"wss://fstream.binance.com/public/ws/{SYMBOL.lower()}@depth20@100ms"  # top 20, we use first 12
+WS_DEPTH    = f"wss://fstream.binance.com/public/ws/{SYMBOL.lower()}@depth20@100ms"
 OI_URL      = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={SYMBOL}"
 
 CVD_WINDOW_SEC = 30
@@ -30,7 +29,6 @@ OI_LOOKBACK_SEC = 30
 CONFIRM_TICKS = 3
 
 OBI_LEVELS = 12
-OBI_THRESHOLD = 0.60
 OBI_TWA_SEC = 6.0
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
@@ -44,12 +42,11 @@ ALERT_ON_CONFIRM_ONLY = True
 # --------------------------------------------------------------------------
 trades = deque()
 oi_hist = deque()
-obi_hist = deque()          # (ts, obi) for TWA
+obi_hist = deque()
 
 _http_session = None
 _last_alerted_label = None
-_last_obi_side = None       # for ±0.60 alerts
-_last_twa_sign = None       # for flip alerts
+_last_twa_sign = None
 
 
 def now():
@@ -100,7 +97,6 @@ def calc_twa_obi():
     prune(obi_hist, OBI_TWA_SEC)
     if len(obi_hist) < 2:
         return None
-    # simple time-weighted average
     total_weight = 0.0
     weighted_sum = 0.0
     for i in range(1, len(obi_hist)):
@@ -118,7 +114,7 @@ def calc_twa_obi():
 
 
 # --------------------------------------------------------------------------
-# TELEGRAM (very short messages)
+# TELEGRAM
 # --------------------------------------------------------------------------
 async def send_telegram_alert(text):
     global _http_session
@@ -150,20 +146,6 @@ def maybe_alert_cvd_oi(label, streak):
     asyncio.create_task(send_telegram_alert(label))
 
 
-def maybe_alert_obi(obi):
-    global _last_obi_side
-    if obi >= OBI_THRESHOLD:
-        side = "OB LONG"
-    elif obi <= -OBI_THRESHOLD:
-        side = "OB SHORT"
-    else:
-        _last_obi_side = None
-        return
-    if side != _last_obi_side:
-        _last_obi_side = side
-        asyncio.create_task(send_telegram_alert(side))
-
-
 def maybe_alert_twa(twa):
     global _last_twa_sign
     if twa is None:
@@ -176,15 +158,12 @@ def maybe_alert_twa(twa):
         return
     if current != _last_twa_sign:
         _last_twa_sign = current
-        if current == "positive":
-            msg = "OBI 🟢"
-        else:
-            msg = "OBI 🔴"
+        msg = "OBI 🟢" if current == "positive" else "OBI 🔴"
         asyncio.create_task(send_telegram_alert(msg))
 
 
 # --------------------------------------------------------------------------
-# WebSocket: aggTrade (CVD)
+# WebSocket: aggTrade
 # --------------------------------------------------------------------------
 async def aggtrade_listener():
     backoff = 2
@@ -210,7 +189,7 @@ async def aggtrade_listener():
 
 
 # --------------------------------------------------------------------------
-# WebSocket: Depth (OBI top 12)
+# WebSocket: Depth (only for TWA OBI)
 # --------------------------------------------------------------------------
 async def depth_listener():
     backoff = 2
@@ -229,10 +208,6 @@ async def depth_listener():
                         obi_hist.append((ts, obi))
                         prune(obi_hist, OBI_TWA_SEC + 2)
 
-                        # live OBI threshold alert
-                        maybe_alert_obi(obi)
-
-                        # TWA flip alert
                         twa = calc_twa_obi()
                         maybe_alert_twa(twa)
                     except Exception:
@@ -358,3 +333,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nstopped.")
+```
