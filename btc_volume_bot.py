@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
 Binance USDT-M Futures — real-time CVD (rolling window) + fastest possible OI polling
-v4 — OI and CVD signals decoupled (either can fire independently) + Telegram alerts +
-     hardened reconnect/error handling.
 """
 
 import asyncio
 import json
 import time
-import os
 from collections import deque
 
 import aiohttp
@@ -29,15 +26,11 @@ CVD_RATIO_THRESHOLD = 0.15
 OI_PCT_THRESHOLD = 0.05
 CONFIRM_TICKS = 3
 
-# --------------------------------------------------------------------------
-# TELEGRAM CONFIG — set these as env vars in Railway instead of hardcoding
-# --------------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs")
-CHAT_ID = os.environ.get("TG_CHAT_ID", "6263967739")
+BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
+CHAT_ID = "6263967739"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 ALERT_ON_CONFIRM_ONLY = True
-ALERT_COOLDOWN_SEC = 60
 
 # --------------------------------------------------------------------------
 # STATE
@@ -45,8 +38,6 @@ ALERT_COOLDOWN_SEC = 60
 trades = deque()
 oi_hist = deque()
 
-_last_alert_label = None
-_last_alert_ts = 0.0
 _http_session = None
 
 
@@ -107,21 +98,11 @@ async def send_telegram_alert(text):
 
 
 def maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi):
-    global _last_alert_label, _last_alert_ts
-
     if label in ("warming up...", "neutral"):
         return
 
     if ALERT_ON_CONFIRM_ONLY and streak < CONFIRM_TICKS:
         return
-
-    t = now()
-    same_label_recent = (label == _last_alert_label) and (t - _last_alert_ts < ALERT_COOLDOWN_SEC)
-    if same_label_recent:
-        return
-
-    _last_alert_label = label
-    _last_alert_ts = t
 
     msg = (
         f"⚡ <b>{SYMBOL}</b> — {label}\n"
@@ -196,7 +177,7 @@ async def oi_poller():
 
 
 # --------------------------------------------------------------------------
-# Signal: OI and CVD are independent now — either can fire on its own
+# Signal: OI and CVD independent — either can fire on its own
 # --------------------------------------------------------------------------
 def classify(cvd_ratio, oi_pct):
     labels = []
