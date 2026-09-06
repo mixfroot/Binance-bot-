@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Binance USDT-M Futures — real-time CVD (rolling window) + fastest possible OI polling
-v3 — adds Telegram alerting on confirmed signals + hardened reconnect/error handling.
+v4 — OI and CVD signals decoupled (either can fire independently) + Telegram alerts +
+     hardened reconnect/error handling.
 """
 
 import asyncio
@@ -13,6 +14,9 @@ from collections import deque
 import aiohttp
 import websockets
 
+# --------------------------------------------------------------------------
+# CONFIG
+# --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
 WS_URL = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@aggTrade"
 OI_URL = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={SYMBOL}"
@@ -25,6 +29,9 @@ CVD_RATIO_THRESHOLD = 0.15
 OI_PCT_THRESHOLD = 0.05
 CONFIRM_TICKS = 3
 
+# --------------------------------------------------------------------------
+# TELEGRAM CONFIG — set these as env vars in Railway instead of hardcoding
+# --------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "6263967739")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -32,6 +39,9 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 ALERT_ON_CONFIRM_ONLY = True
 ALERT_COOLDOWN_SEC = 60
 
+# --------------------------------------------------------------------------
+# STATE
+# --------------------------------------------------------------------------
 trades = deque()
 oi_hist = deque()
 
@@ -75,6 +85,9 @@ def oi_change(lookback_sec=OI_LOOKBACK_SEC):
     return pct_delta, abs_delta, latest_oi, ref_oi
 
 
+# --------------------------------------------------------------------------
+# TELEGRAM
+# --------------------------------------------------------------------------
 async def send_telegram_alert(text):
     global _http_session
     if not BOT_TOKEN or not CHAT_ID:
@@ -119,6 +132,9 @@ def maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi):
     asyncio.create_task(send_telegram_alert(msg))
 
 
+# --------------------------------------------------------------------------
+# CVD: aggTrade websocket
+# --------------------------------------------------------------------------
 async def aggtrade_listener():
     backoff = 2
     while True:
@@ -144,6 +160,9 @@ async def aggtrade_listener():
         backoff = min(backoff * 2, 30)
 
 
+# --------------------------------------------------------------------------
+# OI: REST polling
+# --------------------------------------------------------------------------
 async def oi_poller():
     last_value = None
     session = None
@@ -176,18 +195,28 @@ async def oi_poller():
         await asyncio.sleep(OI_POLL_INTERVAL_SEC)
 
 
+# --------------------------------------------------------------------------
+# Signal: OI and CVD are independent now — either can fire on its own
+# --------------------------------------------------------------------------
 def classify(cvd_ratio, oi_pct):
-    if cvd_ratio is None or oi_pct is None:
-        return "warming up..."
-    if cvd_ratio > CVD_RATIO_THRESHOLD and oi_pct < -OI_PCT_THRESHOLD:
-        return "SHORT COVERING (bullish bias)"
-    if cvd_ratio < -CVD_RATIO_THRESHOLD and oi_pct > OI_PCT_THRESHOLD:
-        return "SHORT BUILDUP (bearish continuation)"
-    if cvd_ratio > CVD_RATIO_THRESHOLD and oi_pct > OI_PCT_THRESHOLD:
-        return "LONG BUILDUP (bullish continuation)"
-    if cvd_ratio < -CVD_RATIO_THRESHOLD and oi_pct < -OI_PCT_THRESHOLD:
-        return "LONG LIQUIDATION (bearish bias)"
-    return "neutral"
+    labels = []
+
+    if oi_pct is not None:
+        if oi_pct >= OI_PCT_THRESHOLD:
+            labels.append("OI RISING")
+        elif oi_pct <= -OI_PCT_THRESHOLD:
+            labels.append("OI FALLING")
+
+    if cvd_ratio is not None:
+        if cvd_ratio > CVD_RATIO_THRESHOLD:
+            labels.append("CVD BUY SKEW")
+        elif cvd_ratio < -CVD_RATIO_THRESHOLD:
+            labels.append("CVD SELL SKEW")
+
+    if not labels:
+        return "neutral" if oi_pct is not None else "warming up..."
+
+    return " + ".join(labels)
 
 
 async def monitor_loop():
