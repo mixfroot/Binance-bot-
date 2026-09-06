@@ -190,10 +190,24 @@ async def oi_poller():
 def classify(cvd_ratio, oi_pct):
     if oi_pct is None:
         return "warming up..."
-    if oi_pct > 0:
-        return "OI RISING"
-    if oi_pct < 0:
-        return "OI FALLING"
+
+    # Simple direction of OI
+    oi_up = oi_pct > 0
+    oi_down = oi_pct < 0
+
+    # CVD direction (even small values count)
+    cvd_buy = cvd_ratio > 0
+    cvd_sell = cvd_ratio < 0
+
+    if oi_up and cvd_buy:
+        return "LONG BUILDING"
+    if oi_down and cvd_buy:
+        return "SHORT COVER"
+    if oi_up and cvd_sell:
+        return "SHORT BUILDING"
+    if oi_down and cvd_sell:
+        return "LONG COVER"
+
     return "neutral"
 
 
