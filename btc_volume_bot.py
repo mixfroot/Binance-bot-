@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Binance USDT-M Futures — real-time CVD (rolling window) + OI polling
-Updated for latest Binance WebSocket routes (2026)
+Binance USDT-M Futures
+- CVD + OI → LONG/SHORT BUILDING/COVER (very short alerts)
+- OBI top 12 levels → alert at ±0.60
+- 6-second Time-Weighted Average OBI → alert on flip positive/negative
 """
 
 import asyncio
@@ -16,14 +18,20 @@ import websockets
 # CONFIG
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
-WS_URL = f"wss://fstream.binance.com/market/ws/{SYMBOL.lower()}@aggTrade"   # ← FIXED (new /market route)
-OI_URL = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={SYMBOL}"
+
+# Latest correct endpoints
+WS_AGGTRADE = f"wss://fstream.binance.com/market/ws/{SYMBOL.lower()}@aggTrade"
+WS_DEPTH    = f"wss://fstream.binance.com/public/ws/{SYMBOL.lower()}@depth20@100ms"  # top 20, we use first 12
+OI_URL      = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={SYMBOL}"
 
 CVD_WINDOW_SEC = 30
 OI_POLL_INTERVAL_SEC = 1.0
 OI_LOOKBACK_SEC = 30
-
 CONFIRM_TICKS = 3
+
+OBI_LEVELS = 12
+OBI_THRESHOLD = 0.60
+OBI_TWA_SEC = 6.0
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
@@ -36,9 +44,12 @@ ALERT_ON_CONFIRM_ONLY = True
 # --------------------------------------------------------------------------
 trades = deque()
 oi_hist = deque()
+obi_hist = deque()          # (ts, obi) for TWA
 
 _http_session = None
 _last_alerted_label = None
+_last_obi_side = None       # for ±0.60 alerts
+_last_twa_sign = None       # for flip alerts
 
 
 def now():
@@ -76,8 +87,38 @@ def oi_change(lookback_sec=OI_LOOKBACK_SEC):
     return pct_delta, abs_delta, latest_oi, ref_oi
 
 
+def calc_obi(bids, asks, levels=OBI_LEVELS):
+    bid_vol = sum(float(q) for _, q in bids[:levels])
+    ask_vol = sum(float(q) for _, q in asks[:levels])
+    total = bid_vol + ask_vol
+    if total == 0:
+        return 0.0
+    return (bid_vol - ask_vol) / total
+
+
+def calc_twa_obi():
+    prune(obi_hist, OBI_TWA_SEC)
+    if len(obi_hist) < 2:
+        return None
+    # simple time-weighted average
+    total_weight = 0.0
+    weighted_sum = 0.0
+    for i in range(1, len(obi_hist)):
+        t0, v0 = obi_hist[i-1]
+        t1, v1 = obi_hist[i]
+        dt = t1 - t0
+        if dt <= 0:
+            continue
+        avg_v = (v0 + v1) / 2
+        weighted_sum += avg_v * dt
+        total_weight += dt
+    if total_weight == 0:
+        return obi_hist[-1][1]
+    return weighted_sum / total_weight
+
+
 # --------------------------------------------------------------------------
-# TELEGRAM
+# TELEGRAM (very short messages)
 # --------------------------------------------------------------------------
 async def send_telegram_alert(text):
     global _http_session
@@ -86,49 +127,71 @@ async def send_telegram_alert(text):
     try:
         if _http_session is None or _http_session.closed:
             _http_session = aiohttp.ClientSession()
-        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+        payload = {"chat_id": CHAT_ID, "text": text}
         async with _http_session.post(
-            TELEGRAM_API_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+            TELEGRAM_API_URL, json=payload, timeout=aiohttp.ClientTimeout(total=8)
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                print(f"[TG] alert failed ({resp.status}): {body}")
+                print(f"[TG] failed ({resp.status}): {body}")
     except Exception as e:
-        print(f"[TG] alert error: {e}")
+        print(f"[TG] error: {e}")
 
 
-def maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi):
+def maybe_alert_cvd_oi(label, streak):
     global _last_alerted_label
-
     if label in ("warming up...", "neutral"):
         return
-
     if ALERT_ON_CONFIRM_ONLY and streak < CONFIRM_TICKS:
         return
-
     if label == _last_alerted_label:
         return
-
     _last_alerted_label = label
+    asyncio.create_task(send_telegram_alert(label))
 
-    msg = (
-        f"ALERT {SYMBOL} - {label}\n"
-        f"CVD ratio (30s): {cvd_ratio:+.2f} (buy {buy_vol:.2f} / sell {sell_vol:.2f})\n"
-        f"OI: {latest_oi:.3f} (change {oi_pct:+.3f}%)\n"
-        f"Confirmed for {streak} ticks"
-    )
-    asyncio.create_task(send_telegram_alert(msg))
+
+def maybe_alert_obi(obi):
+    global _last_obi_side
+    if obi >= OBI_THRESHOLD:
+        side = "OB LONG"
+    elif obi <= -OBI_THRESHOLD:
+        side = "OB SHORT"
+    else:
+        _last_obi_side = None
+        return
+    if side != _last_obi_side:
+        _last_obi_side = side
+        asyncio.create_task(send_telegram_alert(side))
+
+
+def maybe_alert_twa(twa):
+    global _last_twa_sign
+    if twa is None:
+        return
+    current = "positive" if twa > 0 else "negative" if twa < 0 else None
+    if current is None:
+        return
+    if _last_twa_sign is None:
+        _last_twa_sign = current
+        return
+    if current != _last_twa_sign:
+        _last_twa_sign = current
+        if current == "positive":
+            msg = "OBI 🟢"
+        else:
+            msg = "OBI 🔴"
+        asyncio.create_task(send_telegram_alert(msg))
 
 
 # --------------------------------------------------------------------------
-# CVD: aggTrade websocket (updated endpoint)
+# WebSocket: aggTrade (CVD)
 # --------------------------------------------------------------------------
 async def aggtrade_listener():
     backoff = 2
     while True:
         try:
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=10) as ws:
-                print(f"[WS] connected: {WS_URL}")
+            async with websockets.connect(WS_AGGTRADE, ping_interval=20, ping_timeout=10) as ws:
+                print(f"[WS] aggTrade connected")
                 backoff = 2
                 async for raw in ws:
                     try:
@@ -138,18 +201,50 @@ async def aggtrade_listener():
                         signed_qty = -qty if is_buyer_maker else qty
                         trades.append((now(), signed_qty))
                         prune(trades, CVD_WINDOW_SEC)
-                    except Exception as e:
-                        print(f"[WS] bad message skipped: {e}")
-        except (websockets.exceptions.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-            print(f"[WS] disconnected: {e} - reconnecting in {backoff}s")
+                    except Exception:
+                        pass
         except Exception as e:
-            print(f"[WS] unexpected error: {e} - reconnecting in {backoff}s")
+            print(f"[WS] aggTrade disconnected: {e}")
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 30)
 
 
 # --------------------------------------------------------------------------
-# OI: REST polling
+# WebSocket: Depth (OBI top 12)
+# --------------------------------------------------------------------------
+async def depth_listener():
+    backoff = 2
+    while True:
+        try:
+            async with websockets.connect(WS_DEPTH, ping_interval=20, ping_timeout=10) as ws:
+                print(f"[WS] depth connected")
+                backoff = 2
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                        bids = msg.get("b", [])
+                        asks = msg.get("a", [])
+                        obi = calc_obi(bids, asks)
+                        ts = now()
+                        obi_hist.append((ts, obi))
+                        prune(obi_hist, OBI_TWA_SEC + 2)
+
+                        # live OBI threshold alert
+                        maybe_alert_obi(obi)
+
+                        # TWA flip alert
+                        twa = calc_twa_obi()
+                        maybe_alert_twa(twa)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[WS] depth disconnected: {e}")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30)
+
+
+# --------------------------------------------------------------------------
+# OI poller
 # --------------------------------------------------------------------------
 async def oi_poller():
     last_value = None
@@ -173,7 +268,7 @@ async def oi_poller():
                     oi_hist.popleft()
             backoff = 2
         except Exception as e:
-            print(f"[OI] poll error: {e} - backing off {backoff}s")
+            print(f"[OI] error: {e}")
             if session and not session.closed:
                 await session.close()
             session = None
@@ -184,7 +279,7 @@ async def oi_poller():
 
 
 # --------------------------------------------------------------------------
-# Signal logic
+# Signal classification
 # --------------------------------------------------------------------------
 def classify(cvd_ratio, oi_pct):
     if oi_pct is None:
@@ -193,7 +288,6 @@ def classify(cvd_ratio, oi_pct):
     oi_up = oi_pct > 0
     oi_down = oi_pct < 0
 
-    # When CVD is exactly 0, still give OI-based signal
     if cvd_ratio == 0:
         if oi_up:
             return "LONG BUILDING"
@@ -222,7 +316,7 @@ async def monitor_loop():
     while True:
         try:
             cvd_ratio, buy_vol, sell_vol = rolling_cvd_ratio()
-            oi_pct, oi_abs, latest_oi, ref_oi = oi_change()
+            oi_pct, _, latest_oi, _ = oi_change()
             label = classify(cvd_ratio, oi_pct)
 
             if label in ("warming up...", "neutral"):
@@ -232,27 +326,25 @@ async def monitor_loop():
             else:
                 streak, last_label = 1, label
 
-            tag = f"CONFIRMED x{streak}" if streak >= CONFIRM_TICKS else f"building {streak}/{CONFIRM_TICKS}"
             ts_str = time.strftime("%H:%M:%S")
-
             if oi_pct is not None:
-                print(f"{ts_str} | CVD ratio: {cvd_ratio:+.2f} (buy {buy_vol:.2f} / sell {sell_vol:.2f}) | "
-                      f"OI: {latest_oi:.3f} (change {oi_pct:+.3f}%) | {label} [{tag}]")
-                maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi)
+                print(f"{ts_str} | CVD {cvd_ratio:+.2f} | OI {oi_pct:+.3f}% | {label} [{streak}]")
+                maybe_alert_cvd_oi(label, streak)
             else:
-                print(f"{ts_str} | CVD ratio: {cvd_ratio:+.2f} | OI: gathering history...")
+                print(f"{ts_str} | CVD {cvd_ratio:+.2f} | OI gathering...")
 
         except Exception as e:
-            print(f"[MONITOR] loop error: {e}")
+            print(f"[MONITOR] {e}")
         await asyncio.sleep(1)
 
 
 async def main():
-    print(f"[BOOT] starting monitor for {SYMBOL} - Telegram alerts -> chat {CHAT_ID}")
-    await send_telegram_alert(f"Monitor started for {SYMBOL}")
+    print(f"[BOOT] {SYMBOL} monitor started")
+    await send_telegram_alert(f"Monitor started {SYMBOL}")
     try:
         await asyncio.gather(
             aggtrade_listener(),
+            depth_listener(),
             oi_poller(),
             monitor_loop(),
         )
