@@ -1,282 +1,241 @@
+#!/usr/bin/env python3
+"""
+Binance USDT-M Futures — real-time CVD (rolling window) + fastest possible OI polling
+v3 — adds Telegram alerting on confirmed signals + hardened reconnect/error handling.
+"""
+
+import asyncio
 import json
-import os
 import time
-import threading
-import requests
-from datetime import datetime
-from websocket import WebSocketApp
+import os
+from collections import deque
 
-# ====================== CONFIG ======================
-BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
-CHAT_ID   = "6263967739"
+import aiohttp
+import websockets
 
-SYMBOL    = "BTCUSDT"
-TIMEFRAME = "1m"       # change freely: 1m, 5m, 15m, 1h, etc.
-LOOKBACK  = 9           # same as "Lookback Length" in the Pine indicator
-PERCENTILE = 50         # 50 = median (matches your script's `median` line)
-HEARTBEAT_SECONDS = 6 * 60   # send an "alive" ping every 6 minutes
-# ====================================================
+SYMBOL = "BTCUSDT"
+WS_URL = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@aggTrade"
+OI_URL = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={SYMBOL}"
 
-def _timeframe_to_seconds(tf):
-    unit = tf[-1]
-    value = int(tf[:-1])
-    if unit == "m":
-        return value * 60
-    if unit == "h":
-        return value * 3600
-    if unit == "d":
-        return value * 86400
-    return 60  # fallback
+CVD_WINDOW_SEC = 30
+OI_POLL_INTERVAL_SEC = 1.0
+OI_LOOKBACK_SEC = 30
 
-STALE_THRESHOLD_SECONDS = _timeframe_to_seconds(TIMEFRAME) * 2  # no data for 2 candles = stale
+CVD_RATIO_THRESHOLD = 0.15
+OI_PCT_THRESHOLD = 0.05
+CONFIRM_TICKS = 3
 
-closes = []
-previous_median = None
-current_state = None
-last_kline_open_time = None  # de-dupe guard
-last_data_received = None    # timestamp of last processed candle, for stale-feed detection
-active_ws = None             # reference to current websocket, so heartbeat can force-reconnect
+BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs")
+CHAT_ID = os.environ.get("TG_CHAT_ID", "6263967739")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+ALERT_ON_CONFIRM_ONLY = True
+ALERT_COOLDOWN_SEC = 60
+
+trades = deque()
+oi_hist = deque()
+
+_last_alert_label = None
+_last_alert_ts = 0.0
+_http_session = None
 
 
-def send_telegram(text):
+def now():
+    return time.time()
+
+
+def prune(dq, window_sec):
+    cutoff = now() - window_sec
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
+
+
+def rolling_cvd_ratio():
+    prune(trades, CVD_WINDOW_SEC)
+    buy_vol = sum(q for _, q in trades if q > 0)
+    sell_vol = -sum(q for _, q in trades if q < 0)
+    total = buy_vol + sell_vol
+    ratio = (buy_vol - sell_vol) / total if total else 0.0
+    return ratio, buy_vol, sell_vol
+
+
+def oi_change(lookback_sec=OI_LOOKBACK_SEC):
+    if len(oi_hist) < 2:
+        return None, None, None, None
+    latest_ts, latest_oi = oi_hist[-1]
+    target_ts = latest_ts - lookback_sec
+    ref_ts, ref_oi = oi_hist[0]
+    for ts, oi in oi_hist:
+        if ts <= target_ts:
+            ref_ts, ref_oi = ts, oi
+        else:
+            break
+    abs_delta = latest_oi - ref_oi
+    pct_delta = (abs_delta / ref_oi * 100) if ref_oi else 0.0
+    return pct_delta, abs_delta, latest_oi, ref_oi
+
+
+async def send_telegram_alert(text):
+    global _http_session
+    if not BOT_TOKEN or not CHAT_ID:
+        return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            },
-            timeout=12
-        )
+        if _http_session is None or _http_session.closed:
+            _http_session = aiohttp.ClientSession()
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+        async with _http_session.post(
+            TELEGRAM_API_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print(f"[TG] alert failed ({resp.status}): {body}")
     except Exception as e:
-        print("Telegram error:", e)
+        print(f"[TG] alert error: {e}")
 
 
-def percentile_linear_interpolation(data, length, percentile):
-    """
-    Replicates Pine Script's ta.percentile_linear_interpolation exactly.
-    Uses the most recent `length` values, sorts them, and linearly
-    interpolates between the two nearest ranks.
-    """
-    if len(data) < length:
-        return None
+def maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi):
+    global _last_alert_label, _last_alert_ts
 
-    window = sorted(data[-length:])
-    n = len(window)
+    if label in ("warming up...", "neutral"):
+        return
 
-    # Pine's rank formula: (percentile / 100) * (n - 1)
-    rank = (percentile / 100) * (n - 1)
-    low_idx = int(rank)
-    high_idx = min(low_idx + 1, n - 1)
-    frac = rank - low_idx
+    if ALERT_ON_CONFIRM_ONLY and streak < CONFIRM_TICKS:
+        return
 
-    return window[low_idx] + (window[high_idx] - window[low_idx]) * frac
+    t = now()
+    same_label_recent = (label == _last_alert_label) and (t - _last_alert_ts < ALERT_COOLDOWN_SEC)
+    if same_label_recent:
+        return
 
+    _last_alert_label = label
+    _last_alert_ts = t
 
-def on_message(ws, message):
-    global previous_median, current_state, closes, last_kline_open_time, last_data_received
-
-    try:
-        data = json.loads(message)
-        k = data.get("k")
-        if not k or k.get("x") is not True:
-            return
-
-        # de-dupe: skip if this candle's open time was already processed
-        open_time = k.get("t")
-        if open_time == last_kline_open_time:
-            return
-        last_kline_open_time = open_time
-        last_data_received = time.time()
-
-        close_price = float(k["c"])
-        closes.append(close_price)
-
-        # keep a small rolling buffer, just enough for the lookback
-        if len(closes) > LOOKBACK + 5:
-            closes = closes[-(LOOKBACK + 5):]
-
-        median = percentile_linear_interpolation(closes, LOOKBACK, PERCENTILE)
-        if median is None:
-            return  # not enough closes yet to fill the lookback window
-
-        if previous_median is None:
-            previous_median = median
-            return
-
-        new_state = None
-        if median > previous_median:
-            new_state = "Uptrend"
-        elif median < previous_median:
-            new_state = "Downtrend"
-        # if median == previous_median: no change, stay silent
-
-        if new_state and new_state != current_state:
-            current_state = new_state
-            emoji = "🟢" if new_state == "Uptrend" else "🔴"
-            time_str = datetime.fromtimestamp(k["T"] / 1000).strftime("%H:%M")
-            msg = (
-                f"{emoji} <b>{SYMBOL} Trend Change</b>\n\n"
-                f"New State: <b>{new_state}</b>\n"
-                f"Timeframe: {TIMEFRAME}\n"
-                f"Time: {time_str}\n"
-                f"Median: {median:.2f}"
-            )
-            send_telegram(msg)
-
-        previous_median = median
-
-    except Exception as e:
-        send_telegram(f"⚠️ Quantile Bot Error:\n<code>{str(e)}</code>")
-
-
-def on_error(ws, error):
-    global active_ws
-    active_ws = None
-    send_telegram(f"⚠️ Quantile Bot WebSocket error:\n<code>{str(error)}</code>")
-
-
-def on_close(ws, close_status_code, close_msg):
-    global active_ws
-    active_ws = None
-    send_telegram("🔌 Quantile Bot stopped / disconnected. Reconnecting in 3 seconds...")
-
-
-def heartbeat_loop():
-    while True:
-        time.sleep(HEARTBEAT_SECONDS)
-
-        if last_data_received is None:
-            send_telegram(f"💓 {SYMBOL} - no candles received yet")
-            continue
-
-        seconds_since_data = time.time() - last_data_received
-        if seconds_since_data > STALE_THRESHOLD_SECONDS:
-            minutes_since = int(seconds_since_data // 60)
-            send_telegram(
-                f"⚠️ <b>{SYMBOL} No data received in {minutes_since}m</b>\n"
-                f"Feed appears stalled - forcing reconnect..."
-            )
-            # force-close the zombie socket so run_websocket's loop reconnects immediately
-            if active_ws is not None:
-                try:
-                    active_ws.close()
-                except Exception as e:
-                    print("Error forcing ws close:", e)
-            continue
-
-        state_str = current_state if current_state else "Waiting for first signal"
-        send_telegram(f"💓 {SYMBOL} State: <b>{state_str}</b>")
-
-
-def validate_symbol():
-    """Check SYMBOL actually exists on Binance USDT-M Futures before connecting."""
-    try:
-        resp = requests.get(
-            "https://fapi.binance.com/fapi/v1/exchangeInfo",
-            timeout=10
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        valid_symbols = {s["symbol"] for s in data.get("symbols", [])}
-
-        if SYMBOL not in valid_symbols:
-            send_telegram(
-                f"❌ <b>Invalid Symbol</b>\n\n"
-                f"'{SYMBOL}' was not found on Binance Futures.\n"
-                f"Check spelling (e.g. BTCUSDT, ETHUSDT) - bot will not start."
-            )
-            print(f"Invalid symbol: {SYMBOL}. Exiting.")
-            return False
-        return True
-
-    except Exception as e:
-        send_telegram(
-            f"⚠️ Could not verify symbol '{SYMBOL}' (network/API issue):\n"
-            f"<code>{str(e)}</code>\nBot will attempt to start anyway."
-        )
-        return True  # don't block startup just because the check itself failed
-
-
-def backfill_closes():
-    """
-    Called on every (re)connect. Pulls the last few CLOSED candles via REST
-    so that reconnect gaps (downtime, restarts, forced reconnects) don't leave
-    a silent hole in the median calculation - the bot picks up with real data,
-    not just whatever was left in memory.
-    """
-    global closes, last_kline_open_time, last_data_received
-    try:
-        limit = LOOKBACK + 5
-        resp = requests.get(
-            "https://fapi.binance.com/fapi/v1/klines",
-            params={"symbol": SYMBOL, "interval": TIMEFRAME, "limit": limit},
-            timeout=10
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        # REST kline format: [open_time, open, high, low, close, volume, close_time, ...]
-        # keep only candles that have actually closed (close_time in the past)
-        now_ms = time.time() * 1000
-        closed = [row for row in data if row[6] <= now_ms]
-
-        if closed:
-            closes = [float(row[4]) for row in closed]
-            last_kline_open_time = closed[-1][0]
-            last_data_received = time.time()
-            print(f"Backfilled {len(closes)} closes via REST after connect")
-
-    except Exception as e:
-        # non-fatal - bot still works, it'll just rebuild the window live like before
-        print("Backfill error (non-fatal):", e)
-
-
-def on_open(ws):
-    global active_ws
-    active_ws = ws
-    backfill_closes()
-    print("Quantile Median Bot connected")
-    send_telegram(
-        f"✅ <b>Quantile Bot Started</b>\n\n"
-        f"Symbol: {SYMBOL}\n"
-        f"Timeframe: {TIMEFRAME}\n"
-        f"Lookback: {LOOKBACK}"
+    msg = (
+        f"⚡ <b>{SYMBOL}</b> — {label}\n"
+        f"CVD ratio: {cvd_ratio:+.2f} (buy {buy_vol:.2f} / sell {sell_vol:.2f})\n"
+        f"OI: {latest_oi:.3f} (Δ{oi_pct:+.3f}%)\n"
+        f"Confirmed for {streak} ticks"
     )
+    asyncio.create_task(send_telegram_alert(msg))
 
 
-def run_websocket():
-    # Binance split its futures websocket URLs into /public, /market, /private
-    # base paths in 2026 (legacy unrouted /ws/ URLs stopped pushing data for
-    # anything outside the "public" category, including kline streams).
-    # kline streams live under /market, so the routed path is required here.
-    stream = f"wss://fstream.binance.com/market/ws/{SYMBOL.lower()}@kline_{TIMEFRAME}"
+async def aggtrade_listener():
+    backoff = 2
     while True:
         try:
-            ws = WebSocketApp(
-                stream,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-            # tight ping/pong: catches a dead TCP connection within ~13s instead of
-            # sitting silent until the heartbeat's stale-feed check fires
-            ws.run_forever(ping_interval=15, ping_timeout=8)
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=10) as ws:
+                print(f"[WS] connected: {WS_URL}")
+                backoff = 2
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                        qty = float(msg["q"])
+                        is_buyer_maker = msg["m"]
+                        signed_qty = -qty if is_buyer_maker else qty
+                        trades.append((now(), signed_qty))
+                        prune(trades, CVD_WINDOW_SEC)
+                    except Exception as e:
+                        print(f"[WS] bad message skipped: {e}")
+        except (websockets.exceptions.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
+            print(f"[WS] disconnected: {e} — reconnecting in {backoff}s")
         except Exception as e:
-            send_telegram(f"❌ Quantile Bot Crash:\n<code>{str(e)}</code>\nReconnecting in 3s...")
-        time.sleep(3)  # fast reconnect - minimizes the gap where candles could be missed
+            print(f"[WS] unexpected error: {e} — reconnecting in {backoff}s")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30)
+
+
+async def oi_poller():
+    last_value = None
+    session = None
+    backoff = 2
+    while True:
+        try:
+            if session is None or session.closed:
+                session = aiohttp.ClientSession()
+            async with session.get(OI_URL, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                data = await resp.json()
+                oi_val = float(data["openInterest"])
+                ts = now()
+                if oi_val != last_value:
+                    oi_hist.append((ts, oi_val))
+                    last_value = oi_val
+                cutoff = now() - max(OI_LOOKBACK_SEC * 3, 180)
+                while oi_hist and oi_hist[0][0] < cutoff:
+                    oi_hist.popleft()
+            backoff = 2
+        except Exception as e:
+            print(f"[OI] poll error: {e} — backing off {backoff}s")
+            if session and not session.closed:
+                await session.close()
+            session = None
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+            continue
+        await asyncio.sleep(OI_POLL_INTERVAL_SEC)
+
+
+def classify(cvd_ratio, oi_pct):
+    if cvd_ratio is None or oi_pct is None:
+        return "warming up..."
+    if cvd_ratio > CVD_RATIO_THRESHOLD and oi_pct < -OI_PCT_THRESHOLD:
+        return "SHORT COVERING (bullish bias)"
+    if cvd_ratio < -CVD_RATIO_THRESHOLD and oi_pct > OI_PCT_THRESHOLD:
+        return "SHORT BUILDUP (bearish continuation)"
+    if cvd_ratio > CVD_RATIO_THRESHOLD and oi_pct > OI_PCT_THRESHOLD:
+        return "LONG BUILDUP (bullish continuation)"
+    if cvd_ratio < -CVD_RATIO_THRESHOLD and oi_pct < -OI_PCT_THRESHOLD:
+        return "LONG LIQUIDATION (bearish bias)"
+    return "neutral"
+
+
+async def monitor_loop():
+    last_label = None
+    streak = 0
+    while True:
+        try:
+            cvd_ratio, buy_vol, sell_vol = rolling_cvd_ratio()
+            oi_pct, oi_abs, latest_oi, ref_oi = oi_change()
+            label = classify(cvd_ratio, oi_pct)
+
+            if label in ("warming up...", "neutral"):
+                streak, last_label = 0, label
+            elif label == last_label:
+                streak += 1
+            else:
+                streak, last_label = 1, label
+
+            tag = f"CONFIRMED x{streak}" if streak >= CONFIRM_TICKS else f"building {streak}/{CONFIRM_TICKS}"
+            ts_str = time.strftime("%H:%M:%S")
+
+            if oi_pct is not None:
+                print(f"{ts_str} | CVD ratio: {cvd_ratio:+.2f} (buy {buy_vol:.2f} / sell {sell_vol:.2f}) | "
+                      f"OI: {latest_oi:.3f} (Δ{oi_pct:+.3f}%) | {label} [{tag}]")
+                maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi)
+            else:
+                print(f"{ts_str} | CVD ratio: {cvd_ratio:+.2f} | OI: gathering history...")
+        except Exception as e:
+            print(f"[MONITOR] loop error: {e}")
+        await asyncio.sleep(1)
+
+
+async def main():
+    print(f"[BOOT] starting monitor for {SYMBOL} — Telegram alerts -> chat {CHAT_ID}")
+    await send_telegram_alert(f"🟢 CVD/OI monitor started for {SYMBOL}")
+    try:
+        await asyncio.gather(
+            aggtrade_listener(),
+            oi_poller(),
+            monitor_loop(),
+        )
+    finally:
+        if _http_session and not _http_session.closed:
+            await _http_session.close()
 
 
 if __name__ == "__main__":
-    print("Quiet Quantile Median Bot started...")
-    if not validate_symbol():
-        exit(1)
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
     try:
-        run_websocket()
-    except Exception as e:
-        send_telegram(f"💀 <b>Quantile Bot FATAL - process exiting</b>\n<code>{str(e)}</code>")
-        raise
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nstopped.")
