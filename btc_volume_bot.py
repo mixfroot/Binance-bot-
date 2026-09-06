@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Binance USDT-M Futures — real-time CVD (rolling window) + fastest possible OI polling
+Binance USDT-M Futures — real-time CVD (rolling window) + OI polling
+Updated for latest Binance WebSocket routes (2026)
 """
 
 import asyncio
@@ -15,14 +16,13 @@ import websockets
 # CONFIG
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
-WS_URL = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@aggTrade"
+WS_URL = f"wss://fstream.binance.com/market/ws/{SYMBOL.lower()}@aggTrade"   # ← FIXED (new /market route)
 OI_URL = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={SYMBOL}"
 
 CVD_WINDOW_SEC = 30
 OI_POLL_INTERVAL_SEC = 1.0
 OI_LOOKBACK_SEC = 30
 
-CVD_RATIO_THRESHOLD = 0.15
 CONFIRM_TICKS = 3
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
@@ -121,7 +121,7 @@ def maybe_alert(label, streak, cvd_ratio, buy_vol, sell_vol, oi_pct, latest_oi):
 
 
 # --------------------------------------------------------------------------
-# CVD: aggTrade websocket
+# CVD: aggTrade websocket (updated endpoint)
 # --------------------------------------------------------------------------
 async def aggtrade_listener():
     backoff = 2
@@ -184,18 +184,23 @@ async def oi_poller():
 
 
 # --------------------------------------------------------------------------
-# Signal: OI drives the alert, no threshold - any change counts.
-# CVD (30s rolling) is shown as context only, doesn't gate anything.
+# Signal logic
 # --------------------------------------------------------------------------
 def classify(cvd_ratio, oi_pct):
     if oi_pct is None:
         return "warming up..."
 
-    # Simple direction of OI
     oi_up = oi_pct > 0
     oi_down = oi_pct < 0
 
-    # CVD direction (even small values count)
+    # When CVD is exactly 0, still give OI-based signal
+    if cvd_ratio == 0:
+        if oi_up:
+            return "LONG BUILDING"
+        if oi_down:
+            return "SHORT BUILDING"
+        return "neutral"
+
     cvd_buy = cvd_ratio > 0
     cvd_sell = cvd_ratio < 0
 
