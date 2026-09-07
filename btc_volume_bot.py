@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Outlier Trades Chart - Option B
-- One bar per candle = Total USDT of all large trades
-- Number of large trades shown on/below the bar
+Outlier Trades Chart
+- Uses largest trade of each candle in the rolling lookback
+- Default lookback = 30 | Std = 2
+- Option B: one bar per candle + count of large trades
 """
 
 import asyncio
@@ -22,7 +23,7 @@ from matplotlib.patches import Rectangle
 SYMBOL = "BTCUSDT"
 
 VISIBLE_CANDLES = 200
-CALC_LOOKBACK = 18
+CALC_LOOKBACK = 30          # ← changed to 30
 STD_MULT = 2.0
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
@@ -69,10 +70,13 @@ async def fetch_klines(session, symbol, total_needed):
 
 
 # --------------------------------------------------------------------------
-# Fetch aggTrades grouped by 1m candle
+# Fetch aggTrades and keep only the largest trade per candle
 # --------------------------------------------------------------------------
-async def fetch_all_trades(session, symbol, start_ms, end_ms):
-    trades_by_candle = defaultdict(list)
+async def fetch_largest_per_candle(session, symbol, start_ms, end_ms):
+    """
+    Returns: dict[candle_ts] = (max_quote_qty, is_buyer_maker)
+    """
+    largest = {}
     current_start = start_ms
 
     print("   Fetching aggTrades...")
@@ -91,7 +95,9 @@ async def fetch_all_trades(session, symbol, start_ms, end_ms):
             candle_ts = ts - (ts % 60000)
             quote_qty = float(t["q"]) * float(t["p"])
             is_buyer_maker = t["m"]
-            trades_by_candle[candle_ts].append((quote_qty, is_buyer_maker))
+
+            if candle_ts not in largest or quote_qty > largest[candle_ts][0]:
+                largest[candle_ts] = (quote_qty, is_buyer_maker)
 
         if len(trades) < 1000:
             break
@@ -99,37 +105,36 @@ async def fetch_all_trades(session, symbol, start_ms, end_ms):
         current_start = trades[-1]["T"] + 1
         await asyncio.sleep(0.12)
 
-    return trades_by_candle
+    return largest
 
 
 # --------------------------------------------------------------------------
 # Create Chart
 # --------------------------------------------------------------------------
-def create_chart(kline_df, trades_by_candle):
+def create_chart(kline_df, largest_map):
     display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
-    all_candle_ts = [int(ts.timestamp() * 1000) for ts in display_df["open_time"]]
+    all_ts = [int(ts.timestamp() * 1000) for ts in display_df["open_time"]]
 
-    bar_values = []      # total USDT of outliers (positive=buy, negative=sell)
+    bar_values = []
     bar_colors = []
-    bar_counts = []      # how many large trades
+    bar_counts = []
 
-    for i, row in display_df.iterrows():
-        ts_ms = all_candle_ts[i]
-
-        # Rolling window of last CALC_LOOKBACK candles
-        window_trades = []
+    for i in range(len(display_df)):
+        # Get largest trades from the rolling lookback window
+        window_sizes = []
         for j in range(max(0, i - CALC_LOOKBACK + 1), i + 1):
-            window_trades.extend(trades_by_candle.get(all_candle_ts[j], []))
+            ts = all_ts[j]
+            if ts in largest_map:
+                window_sizes.append(largest_map[ts][0])
 
-        if len(window_trades) < 5:
+        if len(window_sizes) < 5:
             bar_values.append(0)
             bar_colors.append("#555555")
             bar_counts.append(0)
             continue
 
-        sizes = np.array([t[0] for t in window_trades])
-        mean = np.mean(sizes)
-        std = np.std(sizes)
+        mean = np.mean(window_sizes)
+        std = np.std(window_sizes)
         if std == 0:
             bar_values.append(0)
             bar_colors.append("#555555")
@@ -139,29 +144,26 @@ def create_chart(kline_df, trades_by_candle):
         upper = mean + STD_MULT * std
         lower = mean - STD_MULT * std
 
-        # Current candle outliers
-        buy_total = 0.0
-        sell_total = 0.0
-        count = 0
-
-        for qty, is_buyer_maker in trades_by_candle.get(ts_ms, []):
-            if qty > upper or qty < lower:
-                count += 1
-                if is_buyer_maker:      # Sell
-                    sell_total += qty
-                else:                   # Buy
-                    buy_total += qty
-
-        net = buy_total - sell_total
-        bar_values.append(net)
-        bar_counts.append(count)
-
-        if net > 0:
-            bar_colors.append("#00ff88")
-        elif net < 0:
-            bar_colors.append("#ff4466")
-        else:
+        # Current candle's largest trade
+        curr_ts = all_ts[i]
+        if curr_ts not in largest_map:
+            bar_values.append(0)
             bar_colors.append("#555555")
+            bar_counts.append(0)
+            continue
+
+        qty, is_buyer_maker = largest_map[curr_ts]
+
+        if qty > upper or qty < lower:
+            # It is an outlier
+            direction = -1 if is_buyer_maker else 1
+            bar_values.append(direction * qty)
+            bar_colors.append("#ff4466" if is_buyer_maker else "#00ff88")
+            bar_counts.append(1)
+        else:
+            bar_values.append(0)
+            bar_colors.append("#555555")
+            bar_counts.append(0)
 
     # ---------- Plot ----------
     fig = plt.figure(figsize=(18, 10), facecolor="black")
@@ -190,24 +192,25 @@ def create_chart(kline_df, trades_by_candle):
     ax_candle.set_xlim(-1, VISIBLE_CANDLES)
     ax_candle.set_title(
         f"{SYMBOL} 1m  |  Visible: {VISIBLE_CANDLES}  |  Lookback: {CALC_LOOKBACK}  |  Std: {STD_MULT}σ\n"
-        f"Bar = Total USDT of large trades  |  Number = count of large trades",
+        f"Using Largest Trade of each candle  |  Green = large Buy  |  Red = large Sell",
         color="white", fontsize=12, pad=8
     )
     ax_candle.grid(True, color="#333333", alpha=0.4)
     plt.setp(ax_candle.get_xticklabels(), visible=False)
 
-    # Outlier bars
-    bars = ax_out.bar(range(len(display_df)), bar_values, color=bar_colors, width=0.65, alpha=0.85)
+    # Bars
+    ax_out.bar(range(len(display_df)), bar_values, color=bar_colors, width=0.65, alpha=0.85)
     ax_out.axhline(0, color="white", linewidth=0.8, alpha=0.5)
 
-    # Add count labels on/below bars
+    # Count labels
+    max_abs = max([abs(v) for v in bar_values] + [1])
     for i, (val, count) in enumerate(zip(bar_values, bar_counts)):
         if count > 0:
-            y_pos = val + (max(abs(v) for v in bar_values) * 0.03 * (1 if val >= 0 else -1))
+            y_pos = val + (max_abs * 0.04 * (1 if val >= 0 else -1))
             ax_out.text(i, y_pos, str(count), color="white", fontsize=7,
                         ha="center", va="bottom" if val >= 0 else "top", fontweight="bold")
 
-    ax_out.set_ylabel("Total Large Trades (USDT)", color="white")
+    ax_out.set_ylabel("Largest Trade (USDT)", color="white")
     ax_out.grid(True, color="#333333", alpha=0.4)
 
     step = max(1, VISIBLE_CANDLES // 12)
@@ -257,18 +260,18 @@ async def main():
             start_ms = int(kline_df["open_time"].iloc[0].timestamp() * 1000)
             end_ms = int(kline_df["open_time"].iloc[-1].timestamp() * 1000) + 60_000
 
-            print("2. Fetching aggTrades...")
-            trades_by_candle = await fetch_all_trades(session, SYMBOL, start_ms, end_ms)
-            print(f"   Collected trades for {len(trades_by_candle)} candles")
+            print("2. Fetching largest trades per candle...")
+            largest_map = await fetch_largest_per_candle(session, SYMBOL, start_ms, end_ms)
+            print(f"   Got largest trade for {len(largest_map)} candles")
 
         print("3. Creating chart...")
-        photo = create_chart(kline_df, trades_by_candle)
+        photo = create_chart(kline_df, largest_map)
         print(f"4. Chart size: {len(photo)/1024:.1f} KB")
 
-        caption = (f"{SYMBOL} – Large Trades (Option B)\n"
+        caption = (f"{SYMBOL} – Largest Trade Outliers\n"
                    f"Visible: {VISIBLE_CANDLES}\n"
                    f"Lookback: {CALC_LOOKBACK} | Std: {STD_MULT}σ\n"
-                   f"Bar = Total USDT | Number = count of large trades")
+                   f"Using largest trade of each candle")
 
         print("5. Sending...")
         await send_photo(photo, caption)
