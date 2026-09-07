@@ -1,5 +1,4 @@
 
-```python
 #!/usr/bin/env python3
 """
 One-time 1m Chart Generator
