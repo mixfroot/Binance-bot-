@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-Largest Outlier Trades Chart
-- 1m Candlesticks
-- Only trades outside rolling Std (lookback=9) are shown
-- Green up = large Buy | Red down = large Sell
+Outlier Trades Chart - Option B
+- One bar per candle = Total USDT of all large trades
+- Number of large trades shown on/below the bar
 """
 
 import asyncio
 import io
 import traceback
 from collections import defaultdict
-from datetime import datetime, timezone
 
 import aiohttp
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.patches import Rectangle, FancyBboxPatch
+from matplotlib.patches import Rectangle
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -25,7 +23,7 @@ SYMBOL = "BTCUSDT"
 
 VISIBLE_CANDLES = 200
 CALC_LOOKBACK = 18
-STD_MULT = 9.0
+STD_MULT = 2.0
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
@@ -71,16 +69,13 @@ async def fetch_klines(session, symbol, total_needed):
 
 
 # --------------------------------------------------------------------------
-# Fetch all aggTrades in range and group by 1m candle
+# Fetch aggTrades grouped by 1m candle
 # --------------------------------------------------------------------------
 async def fetch_all_trades(session, symbol, start_ms, end_ms):
-    """
-    Returns: dict[candle_ts] = list of (quote_qty, is_buyer_maker)
-    """
     trades_by_candle = defaultdict(list)
     current_start = start_ms
 
-    print("   Fetching aggTrades (this will take time)...")
+    print("   Fetching aggTrades...")
     while current_start < end_ms:
         url = (f"https://fapi.binance.com/fapi/v1/aggTrades"
                f"?symbol={symbol}&startTime={current_start}&endTime={end_ms}&limit=1000")
@@ -95,7 +90,7 @@ async def fetch_all_trades(session, symbol, start_ms, end_ms):
             ts = t["T"]
             candle_ts = ts - (ts % 60000)
             quote_qty = float(t["q"]) * float(t["p"])
-            is_buyer_maker = t["m"]  # True = Sell (taker sell)
+            is_buyer_maker = t["m"]
             trades_by_candle[candle_ts].append((quote_qty, is_buyer_maker))
 
         if len(trades) < 1000:
@@ -112,51 +107,64 @@ async def fetch_all_trades(session, symbol, start_ms, end_ms):
 # --------------------------------------------------------------------------
 def create_chart(kline_df, trades_by_candle):
     display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
-
-    # Prepare lists for outlier trades
-    outlier_x = []
-    outlier_y = []
-    outlier_colors = []
-    outlier_sizes = []
-
-    # We need enough history for rolling calculation
     all_candle_ts = [int(ts.timestamp() * 1000) for ts in display_df["open_time"]]
 
-    for i, row in display_df.iterrows():
-        ts_ms = int(row["open_time"].timestamp() * 1000)
+    bar_values = []      # total USDT of outliers (positive=buy, negative=sell)
+    bar_colors = []
+    bar_counts = []      # how many large trades
 
-        # Collect trades from the last CALC_LOOKBACK candles (including current)
+    for i, row in display_df.iterrows():
+        ts_ms = all_candle_ts[i]
+
+        # Rolling window of last CALC_LOOKBACK candles
         window_trades = []
         for j in range(max(0, i - CALC_LOOKBACK + 1), i + 1):
-            prev_ts = all_candle_ts[j]
-            window_trades.extend(trades_by_candle.get(prev_ts, []))
+            window_trades.extend(trades_by_candle.get(all_candle_ts[j], []))
 
         if len(window_trades) < 5:
+            bar_values.append(0)
+            bar_colors.append("#555555")
+            bar_counts.append(0)
             continue
 
         sizes = np.array([t[0] for t in window_trades])
         mean = np.mean(sizes)
         std = np.std(sizes)
         if std == 0:
+            bar_values.append(0)
+            bar_colors.append("#555555")
+            bar_counts.append(0)
             continue
 
         upper = mean + STD_MULT * std
         lower = mean - STD_MULT * std
 
-        # Check current candle trades for outliers
-        current_trades = trades_by_candle.get(ts_ms, [])
-        for qty, is_buyer_maker in current_trades:
+        # Current candle outliers
+        buy_total = 0.0
+        sell_total = 0.0
+        count = 0
+
+        for qty, is_buyer_maker in trades_by_candle.get(ts_ms, []):
             if qty > upper or qty < lower:
-                # Outlier found
-                outlier_x.append(i)
-                # Buy = up (positive), Sell = down (negative)
-                direction = -1 if is_buyer_maker else 1
-                outlier_y.append(direction * qty)
-                outlier_colors.append("#ff4466" if is_buyer_maker else "#00ff88")
-                outlier_sizes.append(qty)
+                count += 1
+                if is_buyer_maker:      # Sell
+                    sell_total += qty
+                else:                   # Buy
+                    buy_total += qty
+
+        net = buy_total - sell_total
+        bar_values.append(net)
+        bar_counts.append(count)
+
+        if net > 0:
+            bar_colors.append("#00ff88")
+        elif net < 0:
+            bar_colors.append("#ff4466")
+        else:
+            bar_colors.append("#555555")
 
     # ---------- Plot ----------
-    fig = plt.figure(figsize=(20, 11), facecolor="black")
+    fig = plt.figure(figsize=(18, 10), facecolor="black")
     gs = fig.add_gridspec(2, 1, height_ratios=[2.8, 1.4], hspace=0.07)
 
     ax_candle = fig.add_subplot(gs[0])
@@ -181,22 +189,27 @@ def create_chart(kline_df, trades_by_candle):
 
     ax_candle.set_xlim(-1, VISIBLE_CANDLES)
     ax_candle.set_title(
-        f"{SYMBOL} 1m  |  Visible: {VISIBLE_CANDLES}  |  Rolling Lookback: {CALC_LOOKBACK}  |  Std: {STD_MULT}σ\n"
-        f"Only outlier trades shown  |  Green = large Buy  |  Red = large Sell",
-        color="white", fontsize=12, pad=10
+        f"{SYMBOL} 1m  |  Visible: {VISIBLE_CANDLES}  |  Lookback: {CALC_LOOKBACK}  |  Std: {STD_MULT}σ\n"
+        f"Bar = Total USDT of large trades  |  Number = count of large trades",
+        color="white", fontsize=12, pad=8
     )
     ax_candle.grid(True, color="#333333", alpha=0.4)
     plt.setp(ax_candle.get_xticklabels(), visible=False)
 
-    # Outlier trades panel
-    if outlier_x:
-        ax_out.bar(outlier_x, outlier_y, color=outlier_colors, width=0.6, alpha=0.85)
-        ax_out.axhline(0, color="white", linewidth=0.8, alpha=0.6)
+    # Outlier bars
+    bars = ax_out.bar(range(len(display_df)), bar_values, color=bar_colors, width=0.65, alpha=0.85)
+    ax_out.axhline(0, color="white", linewidth=0.8, alpha=0.5)
 
-    ax_out.set_ylabel("Outlier Trade Size (USDT)", color="white")
+    # Add count labels on/below bars
+    for i, (val, count) in enumerate(zip(bar_values, bar_counts)):
+        if count > 0:
+            y_pos = val + (max(abs(v) for v in bar_values) * 0.03 * (1 if val >= 0 else -1))
+            ax_out.text(i, y_pos, str(count), color="white", fontsize=7,
+                        ha="center", va="bottom" if val >= 0 else "top", fontweight="bold")
+
+    ax_out.set_ylabel("Total Large Trades (USDT)", color="white")
     ax_out.grid(True, color="#333333", alpha=0.4)
 
-    # X labels
     step = max(1, VISIBLE_CANDLES // 12)
     ax_out.set_xticks(range(0, VISIBLE_CANDLES, step))
     labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, VISIBLE_CANDLES, step)]
@@ -225,11 +238,10 @@ async def send_photo(photo_bytes, caption=""):
         async with session.post(url, data=data, timeout=60) as resp:
             text = await resp.text()
             print(f"Telegram status: {resp.status}")
-            print(f"Telegram response: {text[:400]}")
             if resp.status == 200:
                 print("Photo sent successfully!")
             else:
-                print("Failed to send photo")
+                print("Failed:", text[:300])
 
 
 # --------------------------------------------------------------------------
@@ -245,20 +257,20 @@ async def main():
             start_ms = int(kline_df["open_time"].iloc[0].timestamp() * 1000)
             end_ms = int(kline_df["open_time"].iloc[-1].timestamp() * 1000) + 60_000
 
-            print("2. Fetching all aggTrades (can take 1-3 minutes)...")
+            print("2. Fetching aggTrades...")
             trades_by_candle = await fetch_all_trades(session, SYMBOL, start_ms, end_ms)
-            print(f"   Trades collected for {len(trades_by_candle)} candles")
+            print(f"   Collected trades for {len(trades_by_candle)} candles")
 
         print("3. Creating chart...")
         photo = create_chart(kline_df, trades_by_candle)
         print(f"4. Chart size: {len(photo)/1024:.1f} KB")
 
-        caption = (f"{SYMBOL} – Outlier Trades (>{STD_MULT}σ)\n"
-                   f"Visible: {VISIBLE_CANDLES} candles\n"
-                   f"Rolling Lookback: {CALC_LOOKBACK}\n"
-                   f"Green ↑ = large Buy | Red ↓ = large Sell")
+        caption = (f"{SYMBOL} – Large Trades (Option B)\n"
+                   f"Visible: {VISIBLE_CANDLES}\n"
+                   f"Lookback: {CALC_LOOKBACK} | Std: {STD_MULT}σ\n"
+                   f"Bar = Total USDT | Number = count of large trades")
 
-        print("5. Sending to Telegram...")
+        print("5. Sending...")
         await send_photo(photo, caption)
         print("6. Done.")
 
