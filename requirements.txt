@@ -3,3 +3,4 @@ python-telegram-bot
 aiohttp==3.9.5
 websocket-client
 websockets
+matplotlib
