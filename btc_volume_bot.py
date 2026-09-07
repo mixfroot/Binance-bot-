@@ -24,7 +24,7 @@ from matplotlib.patches import Rectangle, FancyBboxPatch
 SYMBOL = "BTCUSDT"
 
 VISIBLE_CANDLES = 200
-CALC_LOOKBACK = 9
+CALC_LOOKBACK = 18
 STD_MULT = 9.0
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
