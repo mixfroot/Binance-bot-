@@ -21,7 +21,7 @@ from matplotlib.patches import Rectangle
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
-SYMBOL = "BTCUSDT"
+SYMBOL = "RSRUSDT"
 
 VISIBLE_CANDLES = 900       # How many candles you want to SEE on the chart
 CALC_LOOKBACK = 100         # Lookback used for Std calculation
