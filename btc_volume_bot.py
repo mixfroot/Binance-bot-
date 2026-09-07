@@ -19,7 +19,7 @@ from matplotlib.patches import Rectangle
 SYMBOL = "BTCUSDT"
 
 LOOKBACK = 100          # Used for both visible candles AND calculation
-STD_MULT = 1.0          # Standard deviation multiplier (1.0 = 1σ, 2.0 = 2σ, etc.)
+STD_MULT = 2.0          # Standard deviation multiplier (1.0 = 1σ, 2.0 = 2σ, etc.)
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
