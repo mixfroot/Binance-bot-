@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 One-time 1m Chart Generator
@@ -20,8 +19,8 @@ from matplotlib.patches import Rectangle
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
 
-LOOKBACK = 100          # Used for both visible candles AND calculation
-STD_MULT = 1.0          # Standard deviation multiplier
+LOOKBACK = 180
+STD_MULT = 2.0
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
@@ -97,9 +96,13 @@ def create_chart(df: pd.DataFrame) -> bytes:
     # Taker Buy Volume
     ax_buy.bar(range(len(display_df)), display_df["taker_buy_base"],
                color="#00ff88", width=0.7, alpha=0.85)
-    ax_buy.axhline(buy_mean[-1], color="yellow", linestyle="--", linewidth=1.2, alpha=0.9)
+
+    # REMOVED AVERAGE LINE
+    # ax_buy.axhline(buy_mean[-1], color="yellow", linestyle="--", linewidth=1.2, alpha=0.9)
+
     ax_buy.axhline(buy_mean[-1] + STD_MULT * buy_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
     ax_buy.axhline(buy_mean[-1] - STD_MULT * buy_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
+
     ax_buy.set_ylabel("Taker Buy", color="white")
     ax_buy.grid(True, color="#333333", alpha=0.5)
     plt.setp(ax_buy.get_xticklabels(), visible=False)
@@ -107,9 +110,13 @@ def create_chart(df: pd.DataFrame) -> bytes:
     # Taker Sell Volume
     ax_sell.bar(range(len(display_df)), display_df["taker_sell_base"],
                 color="#ff4466", width=0.7, alpha=0.85)
-    ax_sell.axhline(sell_mean[-1], color="yellow", linestyle="--", linewidth=1.2, alpha=0.9)
+
+    # REMOVED AVERAGE LINE
+    # ax_sell.axhline(sell_mean[-1], color="yellow", linestyle="--", linewidth=1.2, alpha=0.9)
+
     ax_sell.axhline(sell_mean[-1] + STD_MULT * sell_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
     ax_sell.axhline(sell_mean[-1] - STD_MULT * sell_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
+
     ax_sell.set_ylabel("Taker Sell", color="white")
     ax_sell.grid(True, color="#333333", alpha=0.5)
 
@@ -128,7 +135,7 @@ def create_chart(df: pd.DataFrame) -> bytes:
 
 
 # --------------------------------------------------------------------------
-# Send Photo (fixed)
+# Send Photo
 # --------------------------------------------------------------------------
 async def send_photo(photo_bytes: bytes, caption: str = ""):
     url = f"{TELEGRAM_API_URL}/sendPhoto"
@@ -136,12 +143,7 @@ async def send_photo(photo_bytes: bytes, caption: str = ""):
     data = aiohttp.FormData()
     data.add_field("chat_id", str(CHAT_ID))
     data.add_field("caption", caption)
-    data.add_field(
-        "photo",
-        photo_bytes,
-        filename="chart.png",
-        content_type="image/png"
-    )
+    data.add_field("photo", photo_bytes, filename="chart.png", content_type="image/png")
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -187,4 +189,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
