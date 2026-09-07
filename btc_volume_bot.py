@@ -23,7 +23,7 @@ from matplotlib.patches import Rectangle
 SYMBOL = "BTCUSDT"
 
 VISIBLE_CANDLES = 200
-CALC_LOOKBACK = 30          # ← changed to 30
+CALC_LOOKBACK = 9          # ← changed to 30
 STD_MULT = 2.0
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
