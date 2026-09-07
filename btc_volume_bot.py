@@ -1,3 +1,5 @@
+
+```python
 #!/usr/bin/env python3
 """
 One-time 1m Chart Generator
@@ -7,6 +9,7 @@ One-time 1m Chart Generator
 
 import asyncio
 import io
+import traceback
 
 import aiohttp
 import matplotlib.pyplot as plt
@@ -14,12 +17,12 @@ import pandas as pd
 from matplotlib.patches import Rectangle
 
 # --------------------------------------------------------------------------
-# CONFIG (change these)
+# CONFIG
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
 
 LOOKBACK = 100          # Used for both visible candles AND calculation
-STD_MULT = 2.0          # Standard deviation multiplier (1.0 = 1σ, 2.0 = 2σ, etc.)
+STD_MULT = 1.0          # Standard deviation multiplier
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
@@ -52,18 +55,14 @@ async def fetch_klines(symbol: str, limit: int = 300):
 # Create Chart
 # --------------------------------------------------------------------------
 def create_chart(df: pd.DataFrame) -> bytes:
-    # Keep only the last LOOKBACK candles for display
-    # (we fetched extra so the first visible candle already has full history)
     display_df = df.tail(LOOKBACK).copy().reset_index(drop=True)
 
-    # Rolling calculations on the full data (pre-warmed)
     buy_mean = df["taker_buy_base"].rolling(LOOKBACK).mean().tail(LOOKBACK).values
     buy_std  = df["taker_buy_base"].rolling(LOOKBACK).std().tail(LOOKBACK).values
 
     sell_mean = df["taker_sell_base"].rolling(LOOKBACK).mean().tail(LOOKBACK).values
     sell_std  = df["taker_sell_base"].rolling(LOOKBACK).std().tail(LOOKBACK).values
 
-    # Create figure
     fig = plt.figure(figsize=(16, 10), facecolor="black")
     gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 1], hspace=0.05)
 
@@ -77,7 +76,7 @@ def create_chart(df: pd.DataFrame) -> bytes:
         for spine in ax.spines.values():
             spine.set_color("white")
 
-    # ---------- Candlesticks ----------
+    # Candlesticks
     width = 0.6
     for idx, row in display_df.iterrows():
         color = "#00ff88" if row["close"] >= row["open"] else "#ff4466"
@@ -96,30 +95,25 @@ def create_chart(df: pd.DataFrame) -> bytes:
     ax_candle.grid(True, color="#333333", alpha=0.6)
     plt.setp(ax_candle.get_xticklabels(), visible=False)
 
-    # ---------- Taker Buy Volume ----------
+    # Taker Buy Volume
     ax_buy.bar(range(len(display_df)), display_df["taker_buy_base"],
                color="#00ff88", width=0.7, alpha=0.85)
-
     ax_buy.axhline(buy_mean[-1], color="yellow", linestyle="--", linewidth=1.2, alpha=0.9)
     ax_buy.axhline(buy_mean[-1] + STD_MULT * buy_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
     ax_buy.axhline(buy_mean[-1] - STD_MULT * buy_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
-
     ax_buy.set_ylabel("Taker Buy", color="white")
     ax_buy.grid(True, color="#333333", alpha=0.5)
     plt.setp(ax_buy.get_xticklabels(), visible=False)
 
-    # ---------- Taker Sell Volume ----------
+    # Taker Sell Volume
     ax_sell.bar(range(len(display_df)), display_df["taker_sell_base"],
                 color="#ff4466", width=0.7, alpha=0.85)
-
     ax_sell.axhline(sell_mean[-1], color="yellow", linestyle="--", linewidth=1.2, alpha=0.9)
     ax_sell.axhline(sell_mean[-1] + STD_MULT * sell_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
     ax_sell.axhline(sell_mean[-1] - STD_MULT * sell_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
-
     ax_sell.set_ylabel("Taker Sell", color="white")
     ax_sell.grid(True, color="#333333", alpha=0.5)
 
-    # X-axis time labels
     step = max(1, LOOKBACK // 8)
     ax_sell.set_xticks(range(0, LOOKBACK, step))
     labels = [display_df["open_time"].iloc[i].strftime("%H:%M") for i in range(0, LOOKBACK, step)]
@@ -135,7 +129,39 @@ def create_chart(df: pd.DataFrame) -> bytes:
 
 
 # --------------------------------------------------------------------------
-# Send to Telegram
+# Send Photo (fixed)
+# --------------------------------------------------------------------------
+async def send_photo(photo_bytes: bytes, caption: str = ""):
+    url = f"{TELEGRAM_API_URL}/sendPhoto"
+
+    data = aiohttp.FormData()
+    data.add_field("chat_id", str(CHAT_ID))
+    data.add_field("caption", caption)
+    data.add_field(
+        "photo",
+        photo_bytes,
+        filename="chart.png",
+        content_type="image/png"
+    )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=data, timeout=30) as resp:
+                result = await resp.text()
+                print(f"Telegram status: {resp.status}")
+                print(f"Telegram response: {result}")
+
+                if resp.status == 200:
+                    print("Photo sent successfully!")
+                else:
+                    print("Failed to send photo")
+    except Exception as e:
+        print("Exception while sending photo:", str(e))
+        traceback.print_exc()
+
+
+# --------------------------------------------------------------------------
+# MAIN
 # --------------------------------------------------------------------------
 async def main():
     try:
@@ -153,9 +179,14 @@ async def main():
 
         print("5. Sending to Telegram...")
         await send_photo(photo, caption)
-        print("6. Done. Exiting.")
+        print("6. Done.")
 
     except Exception as e:
         print("ERROR:", str(e))
-        import traceback
         traceback.print_exc()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
