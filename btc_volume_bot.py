@@ -2,10 +2,14 @@
 """
 Binance USDT-M Futures
 - CVD + OI → LONG/SHORT BUILDING/COVER (very short alerts)
+- Signal only fires when current CVD is outside 1 std of its own 30s rolling
+  average; outside 2 std gets a 🔥 on the same alert name; inside 1 std = no
+  signal, no action.
 """
 
 import asyncio
 import json
+import statistics
 import time
 from collections import deque
 
@@ -36,6 +40,7 @@ ALERT_ON_CONFIRM_ONLY = True
 # --------------------------------------------------------------------------
 trades = deque()
 oi_hist = deque()
+cvd_hist = deque()   # (ts, cvd_ratio) samples over the last CVD_WINDOW_SEC, for mean/std
 
 _http_session = None
 _last_alerted_label = None
@@ -58,6 +63,17 @@ def rolling_cvd_ratio():
     total = buy_vol + sell_vol
     ratio = (buy_vol - sell_vol) / total if total else 0.0
     return ratio, buy_vol, sell_vol
+
+
+def cvd_stats():
+    """Mean and population std of the CVD ratio itself, over the last CVD_WINDOW_SEC."""
+    prune(cvd_hist, CVD_WINDOW_SEC)
+    values = [r for _, r in cvd_hist]
+    if len(values) < 2:
+        return None, None
+    mean = statistics.mean(values)
+    stdev = statistics.pstdev(values)
+    return mean, stdev
 
 
 def oi_change(lookback_sec=OI_LOOKBACK_SEC):
@@ -99,7 +115,7 @@ async def send_telegram_alert(text):
 
 def maybe_alert_cvd_oi(label, streak):
     global _last_alerted_label
-    if label in ("warming up...", "neutral"):
+    if label is None:
         return
     if ALERT_ON_CONFIRM_ONLY and streak < CONFIRM_TICKS:
         return
@@ -202,29 +218,65 @@ def classify(cvd_ratio, oi_pct):
     return "neutral"
 
 
+def apply_std_gate(base_label, cvd_ratio, cvd_mean, cvd_std):
+    """
+    Only let a signal through if the current CVD ratio sits outside 1 std of
+    its own 30s rolling average. Outside 2 std -> same label + 🔥.
+    Inside 1 std, or not enough data yet -> no signal (None).
+    """
+    if base_label in ("warming up...", "neutral"):
+        return None, 0
+    if cvd_mean is None or cvd_std is None or cvd_std <= 0:
+        return None, 0
+
+    deviation = abs(cvd_ratio - cvd_mean)
+
+    if deviation >= 2 * cvd_std:
+        return f"{base_label} \U0001F525", 2
+    if deviation >= 1 * cvd_std:
+        return base_label, 1
+    return None, 0
+
+
 # --------------------------------------------------------------------------
 # Monitor loop
 # --------------------------------------------------------------------------
 async def monitor_loop():
-    last_label = None
+    last_gated_label = None
     streak = 0
     while True:
         try:
             cvd_ratio, buy_vol, sell_vol = rolling_cvd_ratio()
-            oi_pct, _, latest_oi, _ = oi_change()
-            label = classify(cvd_ratio, oi_pct)
+            cvd_hist.append((now(), cvd_ratio))
+            prune(cvd_hist, CVD_WINDOW_SEC)
+            cvd_mean, cvd_std = cvd_stats()
 
-            if label in ("warming up...", "neutral"):
-                streak, last_label = 0, label
-            elif label == last_label:
+            oi_pct, _, latest_oi, _ = oi_change()
+            base_label = classify(cvd_ratio, oi_pct)
+
+            gated_label, tier = apply_std_gate(base_label, cvd_ratio, cvd_mean, cvd_std)
+
+            if gated_label is not None and gated_label == last_gated_label:
                 streak += 1
+            elif gated_label is not None:
+                streak = 1
+                last_gated_label = gated_label
             else:
-                streak, last_label = 1, label
+                streak = 0
+                last_gated_label = None
 
             ts_str = time.strftime("%H:%M:%S")
+            mean_str = f"{cvd_mean:+.3f}" if cvd_mean is not None else "n/a"
+            std_str = f"{cvd_std:.3f}" if cvd_std is not None else "n/a"
+
             if oi_pct is not None:
-                print(f"{ts_str} | CVD {cvd_ratio:+.2f} | OI {oi_pct:+.3f}% | {label} [{streak}]")
-                maybe_alert_cvd_oi(label, streak)
+                shown = gated_label if gated_label is not None else base_label
+                print(
+                    f"{ts_str} | CVD {cvd_ratio:+.2f} (avg {mean_str} std {std_str}) "
+                    f"| OI {oi_pct:+.3f}% | {shown} [{streak}]"
+                )
+                if gated_label is not None:
+                    maybe_alert_cvd_oi(gated_label, streak)
             else:
                 print(f"{ts_str} | CVD {cvd_ratio:+.2f} | OI gathering...")
 
