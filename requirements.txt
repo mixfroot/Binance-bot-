@@ -4,3 +4,4 @@ aiohttp==3.9.5
 websocket-client
 websockets
 matplotlib
+pandas
