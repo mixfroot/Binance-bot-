@@ -2,8 +2,7 @@
 """
 Outlier Trades Chart
 - Uses largest trade of each candle in the rolling lookback
-- Default lookback = 30 | Std = 2
-- Option B: one bar per candle + count of large trades
+- Threshold = 99th Percentile (instead of Std)
 """
 
 import asyncio
@@ -23,14 +22,14 @@ from matplotlib.patches import Rectangle
 SYMBOL = "BTCUSDT"
 
 VISIBLE_CANDLES = 200
-CALC_LOOKBACK = 100          # ← changed to 30
-STD_MULT = 0.5
+CALC_LOOKBACK = 30
+QUANTILE = 0.99          # 99th percentile
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-#  --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Fetch Klines
 # --------------------------------------------------------------------------
 async def fetch_klines(session, symbol, total_needed):
@@ -70,12 +69,9 @@ async def fetch_klines(session, symbol, total_needed):
 
 
 # --------------------------------------------------------------------------
-# Fetch aggTrades and keep only the largest trade per candle
+# Fetch largest trade per candle
 # --------------------------------------------------------------------------
 async def fetch_largest_per_candle(session, symbol, start_ms, end_ms):
-    """
-    Returns: dict[candle_ts] = (max_quote_qty, is_buyer_maker)
-    """
     largest = {}
     current_start = start_ms
 
@@ -120,7 +116,7 @@ def create_chart(kline_df, largest_map):
     bar_counts = []
 
     for i in range(len(display_df)):
-        # Get largest trades from the rolling lookback window
+        # Collect largest trades from the rolling lookback
         window_sizes = []
         for j in range(max(0, i - CALC_LOOKBACK + 1), i + 1):
             ts = all_ts[j]
@@ -133,18 +129,10 @@ def create_chart(kline_df, largest_map):
             bar_counts.append(0)
             continue
 
-        mean = np.mean(window_sizes)
-        std = np.std(window_sizes)
-        if std == 0:
-            bar_values.append(0)
-            bar_colors.append("#555555")
-            bar_counts.append(0)
-            continue
+        # 99th percentile threshold
+        threshold = np.quantile(window_sizes, QUANTILE)
 
-        upper = mean + STD_MULT * std
-        lower = mean - STD_MULT * std
-
-        # Current candle's largest trade
+        # Current candle largest trade
         curr_ts = all_ts[i]
         if curr_ts not in largest_map:
             bar_values.append(0)
@@ -154,8 +142,7 @@ def create_chart(kline_df, largest_map):
 
         qty, is_buyer_maker = largest_map[curr_ts]
 
-        if qty > upper or qty < lower:
-            # It is an outlier
+        if qty > threshold:
             direction = -1 if is_buyer_maker else 1
             bar_values.append(direction * qty)
             bar_colors.append("#ff4466" if is_buyer_maker else "#00ff88")
@@ -191,7 +178,7 @@ def create_chart(kline_df, largest_map):
 
     ax_candle.set_xlim(-1, VISIBLE_CANDLES)
     ax_candle.set_title(
-        f"{SYMBOL} 1m  |  Visible: {VISIBLE_CANDLES}  |  Lookback: {CALC_LOOKBACK}  |  Std: {STD_MULT}σ\n"
+        f"{SYMBOL} 1m  |  Visible: {VISIBLE_CANDLES}  |  Lookback: {CALC_LOOKBACK}  |  Quantile: {int(QUANTILE*100)}th\n"
         f"Using Largest Trade of each candle  |  Green = large Buy  |  Red = large Sell",
         color="white", fontsize=12, pad=8
     )
@@ -270,7 +257,7 @@ async def main():
 
         caption = (f"{SYMBOL} – Largest Trade Outliers\n"
                    f"Visible: {VISIBLE_CANDLES}\n"
-                   f"Lookback: {CALC_LOOKBACK} | Std: {STD_MULT}σ\n"
+                   f"Lookback: {CALC_LOOKBACK} | Quantile: {int(QUANTILE*100)}th\n"
                    f"Using largest trade of each candle")
 
         print("5. Sending...")
