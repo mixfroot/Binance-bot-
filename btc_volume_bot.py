@@ -21,8 +21,8 @@ from matplotlib.patches import Rectangle
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
 
-VISIBLE_CANDLES = 200
-CALC_LOOKBACK = 30
+VISIBLE_CANDLES = 400
+CALC_LOOKBACK = 60
 QUANTILE = 0.99          # 99th percentile
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
