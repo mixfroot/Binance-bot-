@@ -30,7 +30,7 @@ BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# --------------------------------------------------------------------------
+#  --------------------------------------------------------------------------
 # Fetch Klines
 # --------------------------------------------------------------------------
 async def fetch_klines(session, symbol, total_needed):
