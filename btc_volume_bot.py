@@ -24,8 +24,8 @@ from matplotlib.patches import Rectangle
 SYMBOL = "BTCUSDT"
 
 VISIBLE_CANDLES = 400       # How many candles you want to SEE on the chart
-CALC_LOOKBACK = 100         # Lookback used for Std calculation
-STD_MULT = 2.0              # Standard deviation multiplier
+CALC_LOOKBACK = 60         # Lookback used for Std calculation
+STD_MULT = 3.0              # Standard deviation multiplier
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
