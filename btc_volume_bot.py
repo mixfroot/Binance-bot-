@@ -1,240 +1,185 @@
-#!/usr/bin/env python3
-"""
-One-time 1m Chart Generator
-- Candlesticks
-- Taker Buy Volume
-- Taker Sell Volume
-- Delta (Buy - Sell)
-- Custom visible candles + separate calculation lookback
-- Multiple API calls if needed
-"""
-
+import os
 import asyncio
-import io
-import traceback
-
 import aiohttp
-import matplotlib.pyplot as plt
 import pandas as pd
-from matplotlib.patches import Rectangle
+import json
+import warnings
+import socket
+from datetime import datetime, timedelta
 
-# --------------------------------------------------------------------------
-# CONFIG
-# --------------------------------------------------------------------------
+warnings.filterwarnings("ignore")
+
+# === CONFIG ===
 SYMBOL = "BTCUSDT"
+selected_tf = "1m"
+warmup_candles = 200
+rsi_period = 6
 
-VISIBLE_CANDLES = 400       # How many candles you want to SEE on the chart
-CALC_LOOKBACK = 60         # Lookback used for Std calculation
-STD_MULT = 3.0              # Standard deviation multiplier
+# Cooldown for RSI alerts
+cooldown_period = timedelta(minutes=15)
 
-BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
-CHAT_ID = "6263967739"
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# RSI thresholds
+RSI_OVERBOUGHT = 90
+RSI_OVERSOLD = 10
 
-# --------------------------------------------------------------------------
-# Fetch data (supports multiple calls if needed)
-# --------------------------------------------------------------------------
-async def fetch_klines(symbol: str, total_needed: int):
-    """
-    Fetches enough candles. Binance max per request is 1500.
-    If we need more, it will make multiple calls.
-    """
-    all_data = []
-    remaining = total_needed
-    end_time = None
+# Binance endpoints
+binance_rest_url = "https://fapi.binance.com/fapi/v1/klines"
+binance_ws_base = "wss://fstream.binance.com/stream"
 
-    async with aiohttp.ClientSession() as session:
-        while remaining > 0:
-            limit = min(1500, remaining)
-            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}"
-            if end_time:
-                url += f"&endTime={end_time}"
+# Telegram credentials — set these in Railway's Variables tab, NOT hardcoded
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-            async with session.get(url, timeout=15) as resp:
-                data = await resp.json()
+def telegram_url():
+    return f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-            if not data:
-                break
+# === GLOBAL STATE ===
+df_current = pd.DataFrame()
+last_alert_time = None
+message_queue = asyncio.Queue()
 
-            all_data = data + all_data          # prepend older data
-            remaining -= len(data)
-
-            # prepare for next (older) batch
-            end_time = data[0][0] - 1
-
-            if len(data) < limit:
-                break
-
-            await asyncio.sleep(0.3)  # be nice to API
-
-    df = pd.DataFrame(all_data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore"
-    ])
-
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    for col in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
-        df[col] = df[col].astype(float)
-
-    df["taker_sell_base"] = df["volume"] - df["taker_buy_base"]
-    df["delta"] = df["taker_buy_base"] - df["taker_sell_base"]
-
-    # Remove duplicates just in case
-    df = df.drop_duplicates(subset=["open_time"]).reset_index(drop=True)
-    return df
-
-
-# --------------------------------------------------------------------------
-# Create Chart
-# --------------------------------------------------------------------------
-def create_chart(df: pd.DataFrame) -> bytes:
-    # We need CALC_LOOKBACK history before the first visible candle
-    required = VISIBLE_CANDLES + CALC_LOOKBACK
-    if len(df) < required:
-        print(f"Warning: Only {len(df)} candles available, needed {required}")
-
-    display_df = df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
-
-    # Calculate rolling stats on the full dataframe (pre-warmed)
-    buy_std  = df["taker_buy_base"].rolling(CALC_LOOKBACK).std().tail(VISIBLE_CANDLES).values
-    sell_std = df["taker_sell_base"].rolling(CALC_LOOKBACK).std().tail(VISIBLE_CANDLES).values
-    delta_std = df["delta"].rolling(CALC_LOOKBACK).std().tail(VISIBLE_CANDLES).values
-
-    buy_mean  = df["taker_buy_base"].rolling(CALC_LOOKBACK).mean().tail(VISIBLE_CANDLES).values
-    sell_mean = df["taker_sell_base"].rolling(CALC_LOOKBACK).mean().tail(VISIBLE_CANDLES).values
-    delta_mean = df["delta"].rolling(CALC_LOOKBACK).mean().tail(VISIBLE_CANDLES).values
-
-    # Create figure with 4 panels
-    fig = plt.figure(figsize=(16, 12), facecolor="black")
-    gs = fig.add_gridspec(4, 1, height_ratios=[3, 1, 1, 1], hspace=0.06)
-
-    ax_candle = fig.add_subplot(gs[0])
-    ax_buy    = fig.add_subplot(gs[1], sharex=ax_candle)
-    ax_sell   = fig.add_subplot(gs[2], sharex=ax_candle)
-    ax_delta  = fig.add_subplot(gs[3], sharex=ax_candle)
-
-    for ax in [ax_candle, ax_buy, ax_sell, ax_delta]:
-        ax.set_facecolor("black")
-        ax.tick_params(colors="white")
-        for spine in ax.spines.values():
-            spine.set_color("white")
-
-    # ---------- Candlesticks ----------
-    width = 0.6
-    for idx, row in display_df.iterrows():
-        color = "#00ff88" if row["close"] >= row["open"] else "#ff4466"
-        ax_candle.plot([idx, idx], [row["low"], row["high"]], color=color, linewidth=1)
-        body_low = min(row["open"], row["close"])
-        body_height = abs(row["close"] - row["open"]) or 0.01
-        rect = Rectangle((idx - width/2, body_low), width, body_height,
-                         facecolor=color, edgecolor=color)
-        ax_candle.add_patch(rect)
-
-    ax_candle.set_xlim(-1, VISIBLE_CANDLES)
-    ax_candle.set_title(
-        f"{SYMBOL} 1m  |  Visible: {VISIBLE_CANDLES}  |  Calc Lookback: {CALC_LOOKBACK}  |  Std: {STD_MULT}σ",
-        color="white", fontsize=13, pad=10
-    )
-    ax_candle.grid(True, color="#333333", alpha=0.6)
-    plt.setp(ax_candle.get_xticklabels(), visible=False)
-
-    # ---------- Taker Buy ----------
-    ax_buy.bar(range(len(display_df)), display_df["taker_buy_base"],
-               color="#00ff88", width=0.7, alpha=0.85)
-    ax_buy.axhline(buy_mean[-1] + STD_MULT * buy_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
-    ax_buy.axhline(buy_mean[-1] - STD_MULT * buy_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
-    ax_buy.set_ylabel("Buy", color="white")
-    ax_buy.grid(True, color="#333333", alpha=0.5)
-    plt.setp(ax_buy.get_xticklabels(), visible=False)
-
-    # ---------- Taker Sell ----------
-    ax_sell.bar(range(len(display_df)), display_df["taker_sell_base"],
-                color="#ff4466", width=0.7, alpha=0.85)
-    ax_sell.axhline(sell_mean[-1] + STD_MULT * sell_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
-    ax_sell.axhline(sell_mean[-1] - STD_MULT * sell_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
-    ax_sell.set_ylabel("Sell", color="white")
-    ax_sell.grid(True, color="#333333", alpha=0.5)
-    plt.setp(ax_sell.get_xticklabels(), visible=False)
-
-    # ---------- Delta (Buy - Sell) ----------
-    colors = ["#00ff88" if v >= 0 else "#ff4466" for v in display_df["delta"]]
-    ax_delta.bar(range(len(display_df)), display_df["delta"],
-                 color=colors, width=0.7, alpha=0.85)
-    ax_delta.axhline(delta_mean[-1] + STD_MULT * delta_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
-    ax_delta.axhline(delta_mean[-1] - STD_MULT * delta_std[-1], color="cyan", linestyle="--", linewidth=1, alpha=0.8)
-    ax_delta.axhline(0, color="white", linestyle="-", linewidth=0.8, alpha=0.5)
-    ax_delta.set_ylabel("Delta", color="white")
-    ax_delta.grid(True, color="#333333", alpha=0.5)
-
-    # X-axis labels
-    step = max(1, VISIBLE_CANDLES // 8)
-    ax_delta.set_xticks(range(0, VISIBLE_CANDLES, step))
-    labels = [display_df["open_time"].iloc[i].strftime("%H:%M") for i in range(0, VISIBLE_CANDLES, step)]
-    ax_delta.set_xticklabels(labels, rotation=45, color="white")
-
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=140, facecolor="black", edgecolor="none")
-    buf.seek(0)
-    plt.close()
-    return buf.getvalue()
-
-
-# --------------------------------------------------------------------------
-# Send Photo
-# --------------------------------------------------------------------------
-async def send_photo(photo_bytes: bytes, caption: str = ""):
-    url = f"{TELEGRAM_API_URL}/sendPhoto"
-
-    data = aiohttp.FormData()
-    data.add_field("chat_id", str(CHAT_ID))
-    data.add_field("caption", caption)
-    data.add_field("photo", photo_bytes, filename="chart.png", content_type="image/png")
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=data, timeout=30) as resp:
-                result = await resp.text()
-                print(f"Telegram status: {resp.status}")
-                print(f"Telegram response: {result}")
+# === TELEGRAM SENDER (QUEUED) ===
+async def _try_send_telegram(msg, session, retries=3):
+    if not BOT_TOKEN or not CHAT_ID:
+        print(f"[TEL] {msg}")
+        return True
+    for attempt in range(retries):
+        try:
+            async with session.post(
+                telegram_url(),
+                json={"chat_id": CHAT_ID, "text": msg},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
                 if resp.status == 200:
-                    print("Photo sent successfully!")
+                    return True
                 else:
-                    print("Failed to send photo")
-    except Exception as e:
-        print("Exception while sending photo:", str(e))
-        traceback.print_exc()
+                    txt = await resp.text()
+                    print(f"Telegram error {resp.status}: {txt}")
+        except asyncio.TimeoutError:
+            print(f"Telegram timeout, attempt {attempt+1}")
+        except Exception as e:
+            print(f"Telegram failed: {type(e).__name__}: {e}")
+        await asyncio.sleep(2 ** attempt)
+    print(f"Telegram send ultimately failed: {msg}")
+    return False
 
+async def telegram_worker():
+    connector = aiohttp.TCPConnector(family=socket.AF_INET)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        while True:
+            msg = await message_queue.get()
+            await _try_send_telegram(msg, session)
+            await asyncio.sleep(1)
 
-# --------------------------------------------------------------------------
-# MAIN
-# --------------------------------------------------------------------------
+def send_telegram(msg):
+    message_queue.put_nowait(msg)
+
+# === RSI ALERT WITH COOLDOWN ===
+async def check_rsi_and_alert(rsi_value):
+    global last_alert_time
+    now = datetime.utcnow()
+    if last_alert_time and now - last_alert_time < cooldown_period:
+        return
+    if rsi_value > RSI_OVERBOUGHT or rsi_value < RSI_OVERSOLD:
+        side = f"Overbought (> {RSI_OVERBOUGHT})" if rsi_value > RSI_OVERBOUGHT else f"Oversold (< {RSI_OVERSOLD})"
+        msg = f"⚠️ {SYMBOL} ({selected_tf}) {side} — RSI: {rsi_value:.2f}"
+        print(msg)
+        send_telegram(msg)
+        last_alert_time = now
+
+# === HELPERS ===
+async def fetch_candles(session, symbol, interval, limit):
+    url = f"{binance_rest_url}?symbol={symbol}&interval={interval}&limit={limit}"
+    async with session.get(url) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+def build_ohlc_df(raw):
+    if not raw:
+        return pd.DataFrame()
+    df = pd.DataFrame(raw, columns=[
+        "open_time", "open", "high", "low", "close",
+        "volume", "close_time", "quote_volume", "trades",
+        "taker_base_vol", "taker_quote_vol", "ignore"
+    ])
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    return df.set_index("close_time")[["open", "high", "low", "close"]]
+
+def compute_rsi(df):
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/rsi_period, adjust=False, min_periods=rsi_period).mean()
+    avg_loss = loss.ewm(alpha=1/rsi_period, adjust=False, min_periods=rsi_period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+# === STREAM HANDLER ===
+async def process_stream(session):
+    global df_current
+    while True:
+        try:
+            stream = f"{SYMBOL.lower()}@kline_{selected_tf}"
+            url = f"{binance_ws_base}?streams={stream}"
+            print(f"[WS] Connecting {SYMBOL} ({selected_tf})")
+            async with session.ws_connect(url, autoping=True, heartbeat=30) as ws:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        k = data.get("data", {}).get("k", {})
+                        if not k or not k.get("x", False):
+                            continue
+                        close_time = pd.to_datetime(k["T"], unit="ms", utc=True)
+                        row = pd.DataFrame(
+                            [[float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"])]],
+                            index=[close_time],
+                            columns=["open", "high", "low", "close"]
+                        )
+                        if close_time in df_current.index:
+                            df_current = df_current.drop(close_time)
+                        df_current = pd.concat([df_current, row]).iloc[-warmup_candles:]
+
+                        if len(df_current) < rsi_period + 1:
+                            continue
+
+                        rsi_series = compute_rsi(df_current)
+                        await check_rsi_and_alert(rsi_series.iloc[-1])
+
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        raise RuntimeError("WebSocket error")
+        except Exception as e:
+            print(f"[WS] {SYMBOL} error: {type(e).__name__}: {e}")
+            send_telegram(f"⛔ Stream error for {SYMBOL}, reconnecting: {e}")
+            await asyncio.sleep(3)
+            continue
+
+# === MAIN ===
 async def main():
-    try:
-        total_needed = VISIBLE_CANDLES + CALC_LOOKBACK + 50
-        print(f"1. Fetching data (need \~{total_needed} candles)...")
-        df = await fetch_klines(SYMBOL, total_needed)
-        print(f"2. Data fetched: {len(df)} candles")
+    global df_current
+    asyncio.create_task(telegram_worker())
+    async with aiohttp.ClientSession() as session:
+        start_msg = (
+            f"🚀 RSI scanner started for {SYMBOL} ({selected_tf}) | "
+            f"OB>{RSI_OVERBOUGHT} / OS<{RSI_OVERSOLD} | Cooldown: {int(cooldown_period.total_seconds()//60)}m"
+        )
+        print(start_msg)
+        send_telegram(start_msg)
 
-        print("3. Creating chart...")
-        photo = create_chart(df)
-        print(f"4. Chart created: {len(photo)} bytes")
+        raw = await fetch_candles(session, SYMBOL, selected_tf, warmup_candles)
+        df_current = build_ohlc_df(raw)
 
-        caption = (f"{SYMBOL} 1m Chart\n"
-                   f"Visible: {VISIBLE_CANDLES}\n"
-                   f"Calc Lookback: {CALC_LOOKBACK}\n"
-                   f"Std: {STD_MULT}σ")
+        await process_stream(session)
 
-        print("5. Sending to Telegram...")
-        await send_photo(photo, caption)
-        print("6. Done.")
-
-    except Exception as e:
-        print("ERROR:", str(e))
-        traceback.print_exc()
-
-
+# === RESTART LOOP ===
 if __name__ == "__main__":
-    asyncio.run(main())
+    while True:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            print("Interrupted by user. Exiting.")
+            break
+        except Exception as e:
+            print(f"Bot error, restarting: {type(e).__name__} - {e}")
+            asyncio.run(asyncio.sleep(3))
+            continue
