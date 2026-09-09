@@ -27,8 +27,8 @@ binance_rest_url = "https://fapi.binance.com/fapi/v1/klines"
 binance_ws_base = "wss://fstream.binance.com/stream"
 
 # Telegram credentials — set these in Railway's Variables tab, NOT hardcoded
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
+CHAT_ID   = "6263967739"
 
 def telegram_url():
     return f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
