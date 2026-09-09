@@ -13,14 +13,14 @@ warnings.filterwarnings("ignore")
 SYMBOL = "BTCUSDT"
 selected_tf = "1m"
 warmup_candles = 200
-rsi_period = 6
+rsi_period = 14
 
 # Cooldown for RSI alerts
 cooldown_period = timedelta(minutes=15)
 
 # RSI thresholds
-RSI_OVERBOUGHT = 90
-RSI_OVERSOLD = 10
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 
 # Binance endpoints
 binance_rest_url = "https://fapi.binance.com/fapi/v1/klines"
