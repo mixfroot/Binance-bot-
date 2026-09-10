@@ -1,32 +1,3 @@
-**Yes, I understand exactly.**
-
-Here’s the new bot built purely around the Volume Z-Score logic from that Pine Script:
-
-### Core idea
-1. Select up to **10 coins** (same filters as before: ≥50M USDT 24h volume → sorted high→low → only those that had ≥1% move on a 15m candle in the last 21 bars).
-2. For every selected coin:
-   - Fetch the last **1000 closed candles** of the chosen timeframe.
-   - Start a live websocket and keep a **rolling 1000-bar lookback**.
-3. On every **candle close**:
-   - Calculate Volume Z-Score exactly like the script.
-   - Color the bar the same way (red / orange / yellow / green / gray / navy).
-4. **Alerts** only fire on **green and above** (Z ≥ 1.5).
-5. **Each color has its own independent cooldown**.
-6. Cooldown for a color is **reset** only when a **gray or navy** (low-volume) bar closes.
-
-### Default settings (easy to change)
-- Timeframe: `5m` (recommended – 1000 bars ≈ 3.5 days)
-- Z-score length: 1000
-- Alert thresholds:
-  - Red ≥ 6.0
-  - Orange ≥ 4.5
-  - Yellow ≥ 3.0
-  - Green ≥ 1.5
-- Cooldown reset: gray (0 ≤ Z < 1.5) or navy (Z < 0)
-
-Here’s the complete ready-to-run code:
-
-```python
 #!/usr/bin/env python3
 """
 Volume Z-Score Bot
@@ -54,7 +25,7 @@ CHAT_ID   = "6263967739"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 # Volume Z-Score settings (exactly matching the Pine Script)
-TIMEFRAME          = "1m"          # change to "1m", "15m", etc. if you want
+TIMEFRAME          = "5m"          # change to "1m", "15m", etc. if you want
 Z_LENGTH           = 1000
 ALERT_Z_MIN        = 1.5           # green and above
 
@@ -361,24 +332,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Stopped.")
-```
-
-### How the alert + cooldown works
-
-| Z-Score     | Color   | Action                                      |
-|-------------|---------|---------------------------------------------|
-| ≥ 6.0       | Red     | Alert if red cooldown is free → set red cooldown |
-| ≥ 4.5       | Orange  | Alert if orange cooldown free → set it      |
-| ≥ 3.0       | Yellow  | same                                        |
-| ≥ 1.5       | Green   | same                                        |
-| 0 ≤ Z < 1.5 | Gray    | **Reset all cooldowns** (no alert)          |
-| Z < 0       | Navy    | **Reset all cooldowns** (no alert)          |
-
-This matches your request perfectly:  
-- Only green and higher can alert  
-- Each color has its own independent cooldown  
-- Cooldown is cleared only when a gray or navy bar closes
-
-You can change `TIMEFRAME`, the level thresholds, or the selection filters at the top of the file.
-
-Want any adjustments (different TF, stricter cooldown, include the exact volume/Z in a different format, etc.)?
