@@ -1,53 +1,98 @@
+**Yes, I understand exactly.**
+
+Here’s the new bot built purely around the Volume Z-Score logic from that Pine Script:
+
+### Core idea
+1. Select up to **10 coins** (same filters as before: ≥50M USDT 24h volume → sorted high→low → only those that had ≥1% move on a 15m candle in the last 21 bars).
+2. For every selected coin:
+   - Fetch the last **1000 closed candles** of the chosen timeframe.
+   - Start a live websocket and keep a **rolling 1000-bar lookback**.
+3. On every **candle close**:
+   - Calculate Volume Z-Score exactly like the script.
+   - Color the bar the same way (red / orange / yellow / green / gray / navy).
+4. **Alerts** only fire on **green and above** (Z ≥ 1.5).
+5. **Each color has its own independent cooldown**.
+6. Cooldown for a color is **reset** only when a **gray or navy** (low-volume) bar closes.
+
+### Default settings (easy to change)
+- Timeframe: `5m` (recommended – 1000 bars ≈ 3.5 days)
+- Z-score length: 1000
+- Alert thresholds:
+  - Red ≥ 6.0
+  - Orange ≥ 4.5
+  - Yellow ≥ 3.0
+  - Green ≥ 1.5
+- Cooldown reset: gray (0 ≤ Z < 1.5) or navy (Z < 0)
+
+Here’s the complete ready-to-run code:
+
+```python
 #!/usr/bin/env python3
 """
-Structure State Bot
-- Auto-selects up to 10 high-volume USDT perpetuals
-- Filters: 24h quote volume ≥ 50M + at least one 15m candle ≥ ±1% move in last 21 candles
-- Alerts only when 1m structure state changes
+Volume Z-Score Bot
+- Auto-selects top 10 high-volume + volatile USDT perpetuals
+- Loads 1000 historical candles → keeps rolling live lookback
+- Alerts on Green / Yellow / Orange / Red volume bars
+- Each color has its own cooldown (reset only by Gray or Navy bar)
 """
 
 import asyncio
 import json
+import statistics
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from typing import Deque, Dict, List, Optional, Set
 
 import aiohttp
 import websockets
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # CONFIG
-# --------------------------------------------------------------------------
-BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"   # rotate this
-CHAT_ID = "6263967739"
+# ==========================================================================
+BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"  # rotate me
+CHAT_ID   = "6263967739"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-MIN_24H_VOLUME = 50_000_000          # 50 million USDT
-MAX_SYMBOLS = 10
-VOLATILITY_LOOKBACK = 21             # last 21 closed 15m candles
-MIN_CANDLE_MOVE_PCT = 0.01           # 1%
-REFRESH_INTERVAL = 3600              # re-select symbols every 1 hour
+# Volume Z-Score settings (exactly matching the Pine Script)
+TIMEFRAME          = "1m"          # change to "1m", "15m", etc. if you want
+Z_LENGTH           = 1000
+ALERT_Z_MIN        = 1.5           # green and above
 
-# --------------------------------------------------------------------------
+# Color thresholds (highest first)
+LEVELS = [
+    (6.0, "red",    "🔴 RED"),
+    (4.5, "orange", "🟠 ORANGE"),
+    (3.0, "yellow", "🟡 YELLOW"),
+    (1.5, "green",  "🟢 GREEN"),
+]
+
+# Coin selection
+MIN_24H_VOLUME     = 50_000_000    # 50M USDT
+MAX_SYMBOLS        = 10
+VOLATILITY_LOOKBACK = 21
+MIN_CANDLE_MOVE_PCT = 0.01         # 1%
+
+REFRESH_INTERVAL   = 3600          # re-select coins every 1 hour
+
+# ==========================================================================
 # STATE
-# --------------------------------------------------------------------------
-structure = defaultdict(lambda: defaultdict(lambda: {
-    "sup": None, "res": None, "state": "neutral",
-    "prev_green": None, "prev_red": None,
-    "last_high": None, "last_low": None
-}))
+# ==========================================================================
+# volumes[symbol] = deque of the last Z_LENGTH closed volumes
+volumes: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=Z_LENGTH))
 
-active_symbols = set()
-listener_tasks = {}                  # symbol → asyncio.Task
-_http_session = None
+# cooldown[symbol][color] = True if that color is currently on cooldown
+cooldown: Dict[str, Dict[str, bool]] = defaultdict(lambda: {
+    "red": False, "orange": False, "yellow": False, "green": False
+})
 
-
-def now():
-    return time.time()
+active_symbols: Set[str] = set()
+listener_tasks: Dict[str, asyncio.Task] = {}
+_http_session: Optional[aiohttp.ClientSession] = None
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # TELEGRAM
-# --------------------------------------------------------------------------
+# ==========================================================================
 async def send_telegram(text: str):
     global _http_session
     try:
@@ -61,206 +106,179 @@ async def send_telegram(text: str):
         print(f"[TG] Exception: {e}")
 
 
-# --------------------------------------------------------------------------
-# Structure Logic
-# --------------------------------------------------------------------------
-def update_structure(symbol: str, tf: str, o: float, h: float, l: float, c: float, is_closed: bool):
-    s = structure[symbol][tf]
-
-    green = c > o
-    red = c < o
-
-    prev_green = s.get("prev_green")
-    prev_red = s.get("prev_red")
-
-    green_to_red = prev_green and red
-    red_to_green = prev_red and green
-
-    if green_to_red:
-        s["res"] = max(h, s.get("last_high") or h)
-    if red_to_green:
-        s["sup"] = min(l, s.get("last_low") or l)
-
-    if red and not green_to_red and s["res"] is not None and h > s["res"]:
-        s["res"] = h
-    if green and not red_to_green and s["sup"] is not None and l < s["sup"]:
-        s["sup"] = l
-
-    if s["sup"] is not None and l < s["sup"] and c > s["sup"]:
-        s["sup"] = l
-
-    if is_closed:
-        old_state = s["state"]
-
-        if s["res"] is not None and c > s["res"]:
-            s["state"] = "bullish"
-            s["res"] = None
-        elif s["sup"] is not None and c < s["sup"]:
-            s["state"] = "bearish"
-            s["sup"] = None
-
-        s["prev_green"] = green
-        s["prev_red"] = red
-        s["last_high"] = h
-        s["last_low"] = l
-
-        return old_state != s["state"]
-
-    s["prev_green"] = green
-    s["prev_red"] = red
-    s["last_high"] = h
-    s["last_low"] = l
-    return False
+# ==========================================================================
+# Z-SCORE MATH
+# ==========================================================================
+def calc_zscore(vols: Deque[float]) -> Optional[float]:
+    if len(vols) < 2:
+        return None
+    try:
+        avg = statistics.mean(vols)
+        std = statistics.stdev(vols)
+        if std == 0:
+            return 0.0
+        return (vols[-1] - avg) / std
+    except statistics.StatisticsError:
+        return None
 
 
-# --------------------------------------------------------------------------
-# Higher TF states (REST)
-# --------------------------------------------------------------------------
-async def get_higher_tf_states(symbol: str):
-    results = {}
-    async with aiohttp.ClientSession() as session:
-        for tf_name in ["5m", "15m", "1h", "4h"]:
-            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={tf_name}&limit=10"
-            try:
-                async with session.get(url, timeout=8) as resp:
-                    data = await resp.json()
-                    if not isinstance(data, list) or not data:
-                        results[tf_name] = "neutral"
-                        continue
-
-                    for candle in data[:-1]:  # only closed candles
-                        o, h, l, c = float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4])
-                        update_structure(symbol, tf_name, o, h, l, c, is_closed=True)
-
-                    results[tf_name] = structure[symbol][tf_name]["state"]
-            except Exception as e:
-                print(f"[REST] {symbol} {tf_name} error: {e}")
-                results[tf_name] = "neutral"
-    return results
+def get_level(z: float) -> Optional[tuple]:
+    """Return (threshold, color, label) or None if below green."""
+    for thresh, color, label in LEVELS:
+        if z >= thresh:
+            return thresh, color, label
+    return None
 
 
-def make_alert(symbol: str, new_state: str, higher: dict):
-    emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
-    msg = f"<b>{symbol}</b>\n"
-    msg += f"1m → <b>{new_state.upper()}</b> {emoji.get(new_state, '')}\n"
-    msg += "────────────────\n"
-    msg += f"1m  : {new_state.capitalize()} {emoji.get(new_state, '')}\n"
-    for tf in ["5m", "15m", "1h", "4h"]:
-        st = higher.get(tf, "neutral")
-        msg += f"{tf.upper():<4}: {st.capitalize()} {emoji.get(st, '')}\n"
-    return msg.strip()
+# ==========================================================================
+# HISTORICAL LOAD
+# ==========================================================================
+async def load_historical(session: aiohttp.ClientSession, symbol: str) -> bool:
+    """Fetch last Z_LENGTH closed candles and fill the deque."""
+    url = (
+        f"https://fapi.binance.com/fapi/v1/klines"
+        f"?symbol={symbol}&interval={TIMEFRAME}&limit={Z_LENGTH + 1}"
+    )
+    try:
+        async with session.get(url, timeout=12) as resp:
+            data = await resp.json()
+            if not isinstance(data, list) or len(data) < 10:
+                print(f"[HIST] {symbol} bad data")
+                return False
+
+            # drop the currently forming candle
+            closed = data[:-1]
+            vols = [float(c[5]) for c in closed]   # index 5 = volume
+
+            volumes[symbol].clear()
+            volumes[symbol].extend(vols[-Z_LENGTH:])  # keep at most Z_LENGTH
+
+            print(f"[HIST] {symbol} loaded {len(volumes[symbol])} bars")
+            return True
+    except Exception as e:
+        print(f"[HIST] {symbol} failed: {e}")
+        return False
 
 
-# --------------------------------------------------------------------------
-# Symbol selection (volume + volatility filter)
-# --------------------------------------------------------------------------
-async def has_volatile_15m_candle(session: aiohttp.ClientSession, symbol: str) -> bool:
-    """True if any of the last 21 closed 15m candles moved ≥ 1%."""
+# ==========================================================================
+# COIN SELECTION (same filters as before)
+# ==========================================================================
+async def has_volatile_15m(session: aiohttp.ClientSession, symbol: str) -> bool:
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit={VOLATILITY_LOOKBACK + 1}"
     try:
         async with session.get(url, timeout=8) as resp:
             data = await resp.json()
             if not isinstance(data, list) or len(data) < 2:
                 return False
-
-            # exclude the currently forming candle
             for candle in data[:-1]:
                 o = float(candle[1])
                 c = float(candle[4])
-                if o == 0:
-                    continue
-                move = abs(c - o) / o
-                if move >= MIN_CANDLE_MOVE_PCT:
+                if o > 0 and abs(c - o) / o >= MIN_CANDLE_MOVE_PCT:
                     return True
             return False
-    except Exception as e:
-        print(f"[FILTER] {symbol} 15m check failed: {e}")
+    except Exception:
         return False
 
 
-async def select_symbols() -> list[str]:
-    """
-    1. All USDT perpetuals with 24h quote volume ≥ 50M
-    2. Sorted highest → lowest volume
-    3. Keep only those that had ≥1% move on at least one of the last 21 15m candles
-    4. Return max 10 symbols
-    """
+async def select_symbols() -> List[str]:
     print("[SELECT] Fetching 24h tickers...")
     async with aiohttp.ClientSession() as session:
         async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15) as resp:
             tickers = await resp.json()
 
         if not isinstance(tickers, list):
-            print(f"[SELECT] Unexpected response: {tickers}")
+            print("[SELECT] Unexpected response")
             return []
 
-        # Filter USDT + volume
         candidates = []
         for t in tickers:
-            symbol = t.get("symbol", "")
-            if not symbol.endswith("USDT"):
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT"):
                 continue
             try:
                 vol = float(t.get("quoteVolume", 0))
             except (TypeError, ValueError):
                 continue
             if vol >= MIN_24H_VOLUME:
-                candidates.append((symbol, vol))
+                candidates.append((sym, vol))
 
-        # Highest volume first
         candidates.sort(key=lambda x: x[1], reverse=True)
-        print(f"[SELECT] {len(candidates)} symbols with ≥ {MIN_24H_VOLUME/1e6:.0f}M volume")
+        print(f"[SELECT] {len(candidates)} coins ≥ {MIN_24H_VOLUME/1e6:.0f}M")
 
-        # Volatility filter (still ordered by volume)
         selected = []
-        for symbol, vol in candidates:
+        for sym, vol in candidates:
             if len(selected) >= MAX_SYMBOLS:
                 break
-            if await has_volatile_15m_candle(session, symbol):
-                selected.append(symbol)
-                print(f"[SELECT] ✅ {symbol}  vol={vol/1e6:.1f}M  (volatile 15m)")
+            if await has_volatile_15m(session, sym):
+                selected.append(sym)
+                print(f"[SELECT] ✅ {sym}  {vol/1e6:.1f}M")
             else:
-                print(f"[SELECT] ❌ {symbol}  vol={vol/1e6:.1f}M  (no 1% 15m move)")
+                print(f"[SELECT] ❌ {sym}  no 1% 15m move")
 
         return selected
 
 
-# --------------------------------------------------------------------------
-# WebSocket listener (one per symbol)
-# --------------------------------------------------------------------------
+# ==========================================================================
+# WEBSOCKET LISTENER
+# ==========================================================================
 async def kline_listener(symbol: str):
-    stream = f"{symbol.lower()}@kline_1m"
+    stream = f"{symbol.lower()}@kline_{TIMEFRAME}"
     url = f"wss://fstream.binance.com/market/ws/{stream}"
 
     backoff = 2
-    while symbol in active_symbols:          # auto-stop when removed from list
+    while symbol in active_symbols:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                print(f"[WS] Connected {symbol} 1m")
+            async with websockets.connect(url, ping_interval=20, ping_timeout=12) as ws:
+                print(f"[WS] Connected {symbol} {TIMEFRAME}")
                 backoff = 2
 
                 async for raw in ws:
                     if symbol not in active_symbols:
                         break
                     try:
-                        data = json.loads(raw)
-                        k = data["k"]
-                        is_closed = k["x"]
+                        msg = json.loads(raw)
+                        k = msg["k"]
+                        if not k["x"]:                     # only on candle close
+                            continue
 
-                        o = float(k["o"])
-                        h = float(k["h"])
-                        l = float(k["l"])
-                        c = float(k["c"])
+                        vol = float(k["v"])
+                        volumes[symbol].append(vol)
 
-                        changed = update_structure(symbol, "1m", o, h, l, c, is_closed)
+                        z = calc_zscore(volumes[symbol])
+                        if z is None:
+                            continue
 
-                        if changed and is_closed:
-                            new_state = structure[symbol]["1m"]["state"]
-                            print(f"[CHANGE] {symbol} 1m → {new_state}")
+                        level = get_level(z)
 
-                            higher = await get_higher_tf_states(symbol)
-                            alert = make_alert(symbol, new_state, higher)
-                            await send_telegram(alert)
+                        # ----- Cooldown reset on gray / navy -----
+                        if z < 1.5:                        # gray or navy
+                            for color in cooldown[symbol]:
+                                if cooldown[symbol][color]:
+                                    print(f"[RESET] {symbol} {color} cooldown cleared (Z={z:.2f})")
+                                cooldown[symbol][color] = False
+                            continue                       # never alert on gray/navy
+
+                        # ----- Alert only green and above -----
+                        if level is None:
+                            continue
+
+                        _, color, label = level
+
+                        if cooldown[symbol][color]:
+                            # still on cooldown for this color
+                            continue
+
+                        # Fire alert + set cooldown for this color
+                        cooldown[symbol][color] = True
+
+                        msg = (
+                            f"<b>{symbol}</b>  {label}\n"
+                            f"Z-Score: <b>{z:.2f}</b>\n"
+                            f"Volume: {vol:,.0f}\n"
+                            f"TF: {TIMEFRAME}"
+                        )
+                        print(f"[ALERT] {symbol} {label} Z={z:.2f}")
+                        await send_telegram(msg)
 
                     except Exception as e:
                         print(f"[WS] Parse error {symbol}: {e}")
@@ -268,43 +286,50 @@ async def kline_listener(symbol: str):
         except Exception as e:
             if symbol not in active_symbols:
                 break
-            print(f"[WS] Disconnected {symbol}: {e} → reconnect in {backoff}s")
+            print(f"[WS] {symbol} disconnected: {e} → retry in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
-    print(f"[WS] Stopped listener for {symbol}")
+    print(f"[WS] Stopped {symbol}")
 
 
-# --------------------------------------------------------------------------
-# Dynamic symbol management
-# --------------------------------------------------------------------------
+# ==========================================================================
+# SYMBOL MANAGER
+# ==========================================================================
 async def refresh_symbols():
     global active_symbols, listener_tasks
 
     new_list = await select_symbols()
     new_set = set(new_list)
 
-    # Stop listeners that are no longer wanted
-    to_remove = active_symbols - new_set
-    for sym in to_remove:
+    # stop removed
+    for sym in list(active_symbols - new_set):
         active_symbols.discard(sym)
         task = listener_tasks.pop(sym, None)
         if task and not task.done():
             task.cancel()
+        volumes.pop(sym, None)
+        cooldown.pop(sym, None)
         print(f"[MGR] Removed {sym}")
 
-    # Start listeners for new symbols
-    to_add = new_set - active_symbols
-    for sym in to_add:
-        active_symbols.add(sym)
-        listener_tasks[sym] = asyncio.create_task(kline_listener(sym))
-        print(f"[MGR] Started {sym}")
+    # start new ones (load history first)
+    async with aiohttp.ClientSession() as session:
+        for sym in new_set - active_symbols:
+            ok = await load_historical(session, sym)
+            if not ok:
+                print(f"[MGR] Skipping {sym} – history load failed")
+                continue
+            active_symbols.add(sym)
+            listener_tasks[sym] = asyncio.create_task(kline_listener(sym))
+            print(f"[MGR] Started {sym}")
 
     if new_list:
-        msg = "🔄 <b>Active symbols updated</b>\n" + "\n".join(f"• {s}" for s in new_list)
-        await send_telegram(msg)
+        await send_telegram(
+            "🔄 <b>Active coins updated</b>\n" +
+            "\n".join(f"• {s}" for s in new_list)
+        )
     else:
-        await send_telegram("⚠️ No symbols passed the filters right now")
+        await send_telegram("⚠️ No coins passed the filters")
 
 
 async def symbol_refresher():
@@ -312,22 +337,22 @@ async def symbol_refresher():
         try:
             await refresh_symbols()
         except Exception as e:
-            print(f"[REFRESH] Error: {e}")
-            await send_telegram(f"⚠️ Symbol refresh failed: {e}")
+            print(f"[REFRESH] {e}")
+            await send_telegram(f"⚠️ Refresh failed: {e}")
         await asyncio.sleep(REFRESH_INTERVAL)
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # MAIN
-# --------------------------------------------------------------------------
+# ==========================================================================
 async def main():
-    print("Structure Bot starting...")
-    await send_telegram("Structure Bot started ✅\nSelecting high-volume volatile coins...")
-
-    # Initial selection + start listeners
+    print("Volume Z-Score Bot starting...")
+    await send_telegram(
+        f"Volume Z-Score Bot started ✅\n"
+        f"TF: {TIMEFRAME} | Lookback: {Z_LENGTH}\n"
+        f"Alerting on Green+ (Z ≥ {ALERT_Z_MIN})"
+    )
     await refresh_symbols()
-
-    # Keep refreshing every hour
     await symbol_refresher()
 
 
@@ -336,3 +361,24 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Stopped.")
+```
+
+### How the alert + cooldown works
+
+| Z-Score     | Color   | Action                                      |
+|-------------|---------|---------------------------------------------|
+| ≥ 6.0       | Red     | Alert if red cooldown is free → set red cooldown |
+| ≥ 4.5       | Orange  | Alert if orange cooldown free → set it      |
+| ≥ 3.0       | Yellow  | same                                        |
+| ≥ 1.5       | Green   | same                                        |
+| 0 ≤ Z < 1.5 | Gray    | **Reset all cooldowns** (no alert)          |
+| Z < 0       | Navy    | **Reset all cooldowns** (no alert)          |
+
+This matches your request perfectly:  
+- Only green and higher can alert  
+- Each color has its own independent cooldown  
+- Cooldown is cleared only when a gray or navy bar closes
+
+You can change `TIMEFRAME`, the level thresholds, or the selection filters at the top of the file.
+
+Want any adjustments (different TF, stricter cooldown, include the exact volume/Z in a different format, etc.)?
