@@ -1,185 +1,338 @@
-import os
+#!/usr/bin/env python3
+"""
+Structure State Bot
+- Auto-selects up to 10 high-volume USDT perpetuals
+- Filters: 24h quote volume ≥ 50M + at least one 15m candle ≥ ±1% move in last 21 candles
+- Alerts only when 1m structure state changes
+"""
+
 import asyncio
-import aiohttp
-import pandas as pd
 import json
-import warnings
-import socket
-from datetime import datetime, timedelta
+import time
+from collections import defaultdict
 
-warnings.filterwarnings("ignore")
+import aiohttp
+import websockets
 
-# === CONFIG ===
-SYMBOL = "BTCUSDT"
-selected_tf = "1m"
-warmup_candles = 200
-rsi_period = 14
+# --------------------------------------------------------------------------
+# CONFIG
+# --------------------------------------------------------------------------
+BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"   # rotate this
+CHAT_ID = "6263967739"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-# Cooldown for RSI alerts
-cooldown_period = timedelta(minutes=15)
+MIN_24H_VOLUME = 50_000_000          # 50 million USDT
+MAX_SYMBOLS = 10
+VOLATILITY_LOOKBACK = 21             # last 21 closed 15m candles
+MIN_CANDLE_MOVE_PCT = 0.01           # 1%
+REFRESH_INTERVAL = 3600              # re-select symbols every 1 hour
 
-# RSI thresholds
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
+# --------------------------------------------------------------------------
+# STATE
+# --------------------------------------------------------------------------
+structure = defaultdict(lambda: defaultdict(lambda: {
+    "sup": None, "res": None, "state": "neutral",
+    "prev_green": None, "prev_red": None,
+    "last_high": None, "last_low": None
+}))
 
-# Binance endpoints
-binance_rest_url = "https://fapi.binance.com/fapi/v1/klines"
-binance_ws_base = "wss://fstream.binance.com/stream"
+active_symbols = set()
+listener_tasks = {}                  # symbol → asyncio.Task
+_http_session = None
 
-# Telegram credentials — set these in Railway's Variables tab, NOT hardcoded
-BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
-CHAT_ID   = "6263967739"
 
-def telegram_url():
-    return f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+def now():
+    return time.time()
 
-# === GLOBAL STATE ===
-df_current = pd.DataFrame()
-last_alert_time = None
-message_queue = asyncio.Queue()
 
-# === TELEGRAM SENDER (QUEUED) ===
-async def _try_send_telegram(msg, session, retries=3):
-    if not BOT_TOKEN or not CHAT_ID:
-        print(f"[TEL] {msg}")
-        return True
-    for attempt in range(retries):
-        try:
-            async with session.post(
-                telegram_url(),
-                json={"chat_id": CHAT_ID, "text": msg},
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status == 200:
-                    return True
-                else:
-                    txt = await resp.text()
-                    print(f"Telegram error {resp.status}: {txt}")
-        except asyncio.TimeoutError:
-            print(f"Telegram timeout, attempt {attempt+1}")
-        except Exception as e:
-            print(f"Telegram failed: {type(e).__name__}: {e}")
-        await asyncio.sleep(2 ** attempt)
-    print(f"Telegram send ultimately failed: {msg}")
+# --------------------------------------------------------------------------
+# TELEGRAM
+# --------------------------------------------------------------------------
+async def send_telegram(text: str):
+    global _http_session
+    try:
+        if _http_session is None or _http_session.closed:
+            _http_session = aiohttp.ClientSession()
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+        async with _http_session.post(TELEGRAM_API_URL, json=payload, timeout=10) as resp:
+            if resp.status != 200:
+                print(f"[TG] Error {resp.status}: {await resp.text()}")
+    except Exception as e:
+        print(f"[TG] Exception: {e}")
+
+
+# --------------------------------------------------------------------------
+# Structure Logic
+# --------------------------------------------------------------------------
+def update_structure(symbol: str, tf: str, o: float, h: float, l: float, c: float, is_closed: bool):
+    s = structure[symbol][tf]
+
+    green = c > o
+    red = c < o
+
+    prev_green = s.get("prev_green")
+    prev_red = s.get("prev_red")
+
+    green_to_red = prev_green and red
+    red_to_green = prev_red and green
+
+    if green_to_red:
+        s["res"] = max(h, s.get("last_high") or h)
+    if red_to_green:
+        s["sup"] = min(l, s.get("last_low") or l)
+
+    if red and not green_to_red and s["res"] is not None and h > s["res"]:
+        s["res"] = h
+    if green and not red_to_green and s["sup"] is not None and l < s["sup"]:
+        s["sup"] = l
+
+    if s["sup"] is not None and l < s["sup"] and c > s["sup"]:
+        s["sup"] = l
+
+    if is_closed:
+        old_state = s["state"]
+
+        if s["res"] is not None and c > s["res"]:
+            s["state"] = "bullish"
+            s["res"] = None
+        elif s["sup"] is not None and c < s["sup"]:
+            s["state"] = "bearish"
+            s["sup"] = None
+
+        s["prev_green"] = green
+        s["prev_red"] = red
+        s["last_high"] = h
+        s["last_low"] = l
+
+        return old_state != s["state"]
+
+    s["prev_green"] = green
+    s["prev_red"] = red
+    s["last_high"] = h
+    s["last_low"] = l
     return False
 
-async def telegram_worker():
-    connector = aiohttp.TCPConnector(family=socket.AF_INET)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        while True:
-            msg = await message_queue.get()
-            await _try_send_telegram(msg, session)
-            await asyncio.sleep(1)
 
-def send_telegram(msg):
-    message_queue.put_nowait(msg)
-
-# === RSI ALERT WITH COOLDOWN ===
-async def check_rsi_and_alert(rsi_value):
-    global last_alert_time
-    now = datetime.utcnow()
-    if last_alert_time and now - last_alert_time < cooldown_period:
-        return
-    if rsi_value > RSI_OVERBOUGHT or rsi_value < RSI_OVERSOLD:
-        side = f"Overbought (> {RSI_OVERBOUGHT})" if rsi_value > RSI_OVERBOUGHT else f"Oversold (< {RSI_OVERSOLD})"
-        msg = f"⚠️ {SYMBOL} ({selected_tf}) {side} — RSI: {rsi_value:.2f}"
-        print(msg)
-        send_telegram(msg)
-        last_alert_time = now
-
-# === HELPERS ===
-async def fetch_candles(session, symbol, interval, limit):
-    url = f"{binance_rest_url}?symbol={symbol}&interval={interval}&limit={limit}"
-    async with session.get(url) as resp:
-        resp.raise_for_status()
-        return await resp.json()
-
-def build_ohlc_df(raw):
-    if not raw:
-        return pd.DataFrame()
-    df = pd.DataFrame(raw, columns=[
-        "open_time", "open", "high", "low", "close",
-        "volume", "close_time", "quote_volume", "trades",
-        "taker_base_vol", "taker_quote_vol", "ignore"
-    ])
-    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    return df.set_index("close_time")[["open", "high", "low", "close"]]
-
-def compute_rsi(df):
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/rsi_period, adjust=False, min_periods=rsi_period).mean()
-    avg_loss = loss.ewm(alpha=1/rsi_period, adjust=False, min_periods=rsi_period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-# === STREAM HANDLER ===
-async def process_stream(session):
-    global df_current
-    while True:
-        try:
-            stream = f"{SYMBOL.lower()}@kline_{selected_tf}"
-            url = f"{binance_ws_base}?streams={stream}"
-            print(f"[WS] Connecting {SYMBOL} ({selected_tf})")
-            async with session.ws_connect(url, autoping=True, heartbeat=30) as ws:
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = json.loads(msg.data)
-                        k = data.get("data", {}).get("k", {})
-                        if not k or not k.get("x", False):
-                            continue
-                        close_time = pd.to_datetime(k["T"], unit="ms", utc=True)
-                        row = pd.DataFrame(
-                            [[float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"])]],
-                            index=[close_time],
-                            columns=["open", "high", "low", "close"]
-                        )
-                        if close_time in df_current.index:
-                            df_current = df_current.drop(close_time)
-                        df_current = pd.concat([df_current, row]).iloc[-warmup_candles:]
-
-                        if len(df_current) < rsi_period + 1:
-                            continue
-
-                        rsi_series = compute_rsi(df_current)
-                        await check_rsi_and_alert(rsi_series.iloc[-1])
-
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        raise RuntimeError("WebSocket error")
-        except Exception as e:
-            print(f"[WS] {SYMBOL} error: {type(e).__name__}: {e}")
-            send_telegram(f"⛔ Stream error for {SYMBOL}, reconnecting: {e}")
-            await asyncio.sleep(3)
-            continue
-
-# === MAIN ===
-async def main():
-    global df_current
-    asyncio.create_task(telegram_worker())
+# --------------------------------------------------------------------------
+# Higher TF states (REST)
+# --------------------------------------------------------------------------
+async def get_higher_tf_states(symbol: str):
+    results = {}
     async with aiohttp.ClientSession() as session:
-        start_msg = (
-            f"🚀 RSI scanner started for {SYMBOL} ({selected_tf}) | "
-            f"OB>{RSI_OVERBOUGHT} / OS<{RSI_OVERSOLD} | Cooldown: {int(cooldown_period.total_seconds()//60)}m"
-        )
-        print(start_msg)
-        send_telegram(start_msg)
+        for tf_name in ["5m", "15m", "1h", "4h"]:
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={tf_name}&limit=10"
+            try:
+                async with session.get(url, timeout=8) as resp:
+                    data = await resp.json()
+                    if not isinstance(data, list) or not data:
+                        results[tf_name] = "neutral"
+                        continue
 
-        raw = await fetch_candles(session, SYMBOL, selected_tf, warmup_candles)
-        df_current = build_ohlc_df(raw)
+                    for candle in data[:-1]:  # only closed candles
+                        o, h, l, c = float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4])
+                        update_structure(symbol, tf_name, o, h, l, c, is_closed=True)
 
-        await process_stream(session)
+                    results[tf_name] = structure[symbol][tf_name]["state"]
+            except Exception as e:
+                print(f"[REST] {symbol} {tf_name} error: {e}")
+                results[tf_name] = "neutral"
+    return results
 
-# === RESTART LOOP ===
-if __name__ == "__main__":
+
+def make_alert(symbol: str, new_state: str, higher: dict):
+    emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
+    msg = f"<b>{symbol}</b>\n"
+    msg += f"1m → <b>{new_state.upper()}</b> {emoji.get(new_state, '')}\n"
+    msg += "────────────────\n"
+    msg += f"1m  : {new_state.capitalize()} {emoji.get(new_state, '')}\n"
+    for tf in ["5m", "15m", "1h", "4h"]:
+        st = higher.get(tf, "neutral")
+        msg += f"{tf.upper():<4}: {st.capitalize()} {emoji.get(st, '')}\n"
+    return msg.strip()
+
+
+# --------------------------------------------------------------------------
+# Symbol selection (volume + volatility filter)
+# --------------------------------------------------------------------------
+async def has_volatile_15m_candle(session: aiohttp.ClientSession, symbol: str) -> bool:
+    """True if any of the last 21 closed 15m candles moved ≥ 1%."""
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit={VOLATILITY_LOOKBACK + 1}"
+    try:
+        async with session.get(url, timeout=8) as resp:
+            data = await resp.json()
+            if not isinstance(data, list) or len(data) < 2:
+                return False
+
+            # exclude the currently forming candle
+            for candle in data[:-1]:
+                o = float(candle[1])
+                c = float(candle[4])
+                if o == 0:
+                    continue
+                move = abs(c - o) / o
+                if move >= MIN_CANDLE_MOVE_PCT:
+                    return True
+            return False
+    except Exception as e:
+        print(f"[FILTER] {symbol} 15m check failed: {e}")
+        return False
+
+
+async def select_symbols() -> list[str]:
+    """
+    1. All USDT perpetuals with 24h quote volume ≥ 50M
+    2. Sorted highest → lowest volume
+    3. Keep only those that had ≥1% move on at least one of the last 21 15m candles
+    4. Return max 10 symbols
+    """
+    print("[SELECT] Fetching 24h tickers...")
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15) as resp:
+            tickers = await resp.json()
+
+        if not isinstance(tickers, list):
+            print(f"[SELECT] Unexpected response: {tickers}")
+            return []
+
+        # Filter USDT + volume
+        candidates = []
+        for t in tickers:
+            symbol = t.get("symbol", "")
+            if not symbol.endswith("USDT"):
+                continue
+            try:
+                vol = float(t.get("quoteVolume", 0))
+            except (TypeError, ValueError):
+                continue
+            if vol >= MIN_24H_VOLUME:
+                candidates.append((symbol, vol))
+
+        # Highest volume first
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        print(f"[SELECT] {len(candidates)} symbols with ≥ {MIN_24H_VOLUME/1e6:.0f}M volume")
+
+        # Volatility filter (still ordered by volume)
+        selected = []
+        for symbol, vol in candidates:
+            if len(selected) >= MAX_SYMBOLS:
+                break
+            if await has_volatile_15m_candle(session, symbol):
+                selected.append(symbol)
+                print(f"[SELECT] ✅ {symbol}  vol={vol/1e6:.1f}M  (volatile 15m)")
+            else:
+                print(f"[SELECT] ❌ {symbol}  vol={vol/1e6:.1f}M  (no 1% 15m move)")
+
+        return selected
+
+
+# --------------------------------------------------------------------------
+# WebSocket listener (one per symbol)
+# --------------------------------------------------------------------------
+async def kline_listener(symbol: str):
+    stream = f"{symbol.lower()}@kline_1m"
+    url = f"wss://fstream.binance.com/market/ws/{stream}"
+
+    backoff = 2
+    while symbol in active_symbols:          # auto-stop when removed from list
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                print(f"[WS] Connected {symbol} 1m")
+                backoff = 2
+
+                async for raw in ws:
+                    if symbol not in active_symbols:
+                        break
+                    try:
+                        data = json.loads(raw)
+                        k = data["k"]
+                        is_closed = k["x"]
+
+                        o = float(k["o"])
+                        h = float(k["h"])
+                        l = float(k["l"])
+                        c = float(k["c"])
+
+                        changed = update_structure(symbol, "1m", o, h, l, c, is_closed)
+
+                        if changed and is_closed:
+                            new_state = structure[symbol]["1m"]["state"]
+                            print(f"[CHANGE] {symbol} 1m → {new_state}")
+
+                            higher = await get_higher_tf_states(symbol)
+                            alert = make_alert(symbol, new_state, higher)
+                            await send_telegram(alert)
+
+                    except Exception as e:
+                        print(f"[WS] Parse error {symbol}: {e}")
+
+        except Exception as e:
+            if symbol not in active_symbols:
+                break
+            print(f"[WS] Disconnected {symbol}: {e} → reconnect in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+    print(f"[WS] Stopped listener for {symbol}")
+
+
+# --------------------------------------------------------------------------
+# Dynamic symbol management
+# --------------------------------------------------------------------------
+async def refresh_symbols():
+    global active_symbols, listener_tasks
+
+    new_list = await select_symbols()
+    new_set = set(new_list)
+
+    # Stop listeners that are no longer wanted
+    to_remove = active_symbols - new_set
+    for sym in to_remove:
+        active_symbols.discard(sym)
+        task = listener_tasks.pop(sym, None)
+        if task and not task.done():
+            task.cancel()
+        print(f"[MGR] Removed {sym}")
+
+    # Start listeners for new symbols
+    to_add = new_set - active_symbols
+    for sym in to_add:
+        active_symbols.add(sym)
+        listener_tasks[sym] = asyncio.create_task(kline_listener(sym))
+        print(f"[MGR] Started {sym}")
+
+    if new_list:
+        msg = "🔄 <b>Active symbols updated</b>\n" + "\n".join(f"• {s}" for s in new_list)
+        await send_telegram(msg)
+    else:
+        await send_telegram("⚠️ No symbols passed the filters right now")
+
+
+async def symbol_refresher():
     while True:
         try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            print("Interrupted by user. Exiting.")
-            break
+            await refresh_symbols()
         except Exception as e:
-            print(f"Bot error, restarting: {type(e).__name__} - {e}")
-            asyncio.run(asyncio.sleep(3))
-            continue
+            print(f"[REFRESH] Error: {e}")
+            await send_telegram(f"⚠️ Symbol refresh failed: {e}")
+        await asyncio.sleep(REFRESH_INTERVAL)
+
+
+# --------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------
+async def main():
+    print("Structure Bot starting...")
+    await send_telegram("Structure Bot started ✅\nSelecting high-volume volatile coins...")
+
+    # Initial selection + start listeners
+    await refresh_symbols()
+
+    # Keep refreshing every hour
+    await symbol_refresher()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Stopped.")
