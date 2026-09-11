@@ -90,13 +90,9 @@ async def fetch_all_trade_times(session, symbol, start_ms, end_ms):
 
 
 # --------------------------------------------------------------------------
-# Trade-level rolling 60s rate, fully independent of candles
+# Trade-level rolling 60s rate
 # --------------------------------------------------------------------------
 def compute_trade_level_rolling_rate(trade_times_ms, window_sec=ROLLING_SECONDS):
-    """
-    For every trade i, count trades in [t_i - window_sec, t_i], rate = count/window_sec.
-    Pure trade-tape computation, no candle involvement at all.
-    """
     n = len(trade_times_ms)
     window_ms = window_sec * 1000
     rates = np.zeros(n)
@@ -131,17 +127,22 @@ def flag_candles_from_events(event_times_ms, event_rates, kline_df):
             continue
         if idx not in flagged or r > flagged[idx]:
             flagged[idx] = r
-    return flagged  # {candle_index: peak rate}
+    return flagged
 
 
 # --------------------------------------------------------------------------
-# Chart
+# Chart (FIXED FLAG MAPPING)
 # --------------------------------------------------------------------------
 def create_chart(kline_df, flagged_full, threshold):
     display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
     offset = len(kline_df) - len(display_df)
-    flagged = {idx - offset: r for idx, r in flagged_full.items()
-               if 0 <= idx - offset < len(display_df)}
+
+    # FIXED: Proper mapping of historical flagged candles into visible window
+    flagged = {}
+    for idx, r in flagged_full.items():
+        adj = idx - offset
+        if 0 <= adj < len(display_df):
+            flagged[adj] = r
 
     volumes = display_df["volume"].astype(float).values
 
@@ -232,7 +233,7 @@ async def main():
             print("2. Fetching full trade tape...")
             trade_times = await fetch_all_trade_times(session, SYMBOL, start_ms, end_ms)
 
-        print("3. Computing trade-level rolling 60s rate (candle-independent)...")
+        print("3. Computing trade-level rolling 60s rate...")
         rates = compute_trade_level_rolling_rate(trade_times)
         print(f"   rate range: min={rates.min():.2f} max={rates.max():.2f} "
               f"median={np.median(rates):.2f} trades/sec")
