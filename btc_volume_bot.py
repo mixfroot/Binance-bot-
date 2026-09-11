@@ -23,7 +23,7 @@ from matplotlib.patches import Rectangle
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
 
-VISIBLE_CANDLES = 200
+VISIBLE_CANDLES = 600
 CALC_LOOKBACK = 30          # same as your original
 STD_MULT = 2.0
 
