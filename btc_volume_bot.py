@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Hawkes Process anomaly detection - ported from tripolskypetr/volume-anomaly (Hawkes-only)
-- Fit μ, α, β via MLE (Nelder-Mead) on a historical trade chunk
-- Slide a `recent` window across the rest of the tape
-- Score each window: sigmoid(peakLambda/meanLambda, centered at ratio=2)
-- Map flagged windows onto candles, mark on chart
+Trade arrival-rate panel: instantaneous inter-arrival rate per side (buy/sell),
+averaged per candle, plotted as mirrored green/red bars, with a rolling
+z-score line (lookback=30) of the combined rate overlaid.
 """
 
 import asyncio
@@ -16,18 +14,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.patches import Rectangle
-from scipy.optimize import minimize
 
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
 VISIBLE_CANDLES = 200
-
-TRAIN_TRADES = 1200         # historical trades used to fit mu/alpha/beta (calm baseline)
-RECENT_WINDOW = 150         # trades per sliding evaluation window
-STEP = 50                   # trades to advance the window each step
-SCORE_THRESHOLD = 0.5       # sigmoid score >= this -> flagged (0.5 = 2x baseline intensity)
+Z_LOOKBACK = 30
+Z_THRESHOLD = 2.0
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
@@ -35,7 +29,7 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
 # --------------------------------------------------------------------------
-# Fetch Klines / Trades (same as before)
+# Fetch Klines
 # --------------------------------------------------------------------------
 async def fetch_klines(session, symbol, total_needed):
     all_data = []
@@ -68,8 +62,16 @@ async def fetch_klines(session, symbol, total_needed):
     return df.drop_duplicates(subset=["open_time"]).reset_index(drop=True)
 
 
-async def fetch_all_trade_times(session, symbol, start_ms, end_ms):
+# --------------------------------------------------------------------------
+# Fetch ALL agg trades WITH buy/sell side
+# --------------------------------------------------------------------------
+async def fetch_all_agg_trades(session, symbol, start_ms, end_ms):
+    """Returns (times_ms, is_buyer_maker) sorted ascending.
+    isBuyerMaker=True  -> seller was the aggressor (SELL)
+    isBuyerMaker=False -> buyer was the aggressor (BUY)
+    """
     times = []
+    maker_flags = []
     current_start = start_ms
     print("   Fetching aggTrades...")
     while current_start < end_ms:
@@ -81,183 +83,79 @@ async def fetch_all_trade_times(session, symbol, start_ms, end_ms):
             break
         for t in trades:
             times.append(t["T"])
+            maker_flags.append(t["m"])
         if len(trades) < 1000:
             break
         current_start = trades[-1]["T"] + 1
         await asyncio.sleep(0.12)
-    times.sort()
-    print(f"   Collected {len(times):,} trades")
-    return np.array(times, dtype=np.int64)
+
+    order = np.argsort(times)
+    times_ms = np.array(times, dtype=np.int64)[order]
+    is_buyer_maker = np.array(maker_flags, dtype=bool)[order]
+    print(f"   Collected {len(times_ms):,} trades")
+    return times_ms, is_buyer_maker
 
 
 # --------------------------------------------------------------------------
-# Hawkes math (ported from volume-anomaly's src/math)
+# Instantaneous arrival rate per candle (averaged 1/dt within each candle)
 # --------------------------------------------------------------------------
-def hawkes_log_likelihood(timestamps_s, mu, alpha, beta):
-    """Ogata O(n) recursive log-likelihood. timestamps_s sorted ascending, seconds."""
-    if mu <= 0 or alpha <= 0 or beta <= 0:
-        return -np.inf
-    n = len(timestamps_s)
-    if n == 0:
-        return -np.inf
-
-    T = timestamps_s[-1] - timestamps_s[0]
-    A = 0.0
-    ll_data = 0.0
-    compensator = 0.0
-    t_prev = timestamps_s[0]
-
+def compute_candle_arrival_rate(times_ms, bar_open_ms, bar_close_ms):
+    n = len(bar_open_ms)
+    rates = np.zeros(n)
+    left = 0
     for i in range(n):
-        ti = timestamps_s[i]
-        if i > 0:
-            A = np.exp(-beta * (ti - t_prev)) * (1 + A)
-        lam = mu + alpha * A
-        if lam <= 0:
-            return -np.inf
-        ll_data += np.log(lam)
-        compensator += (1 - np.exp(-beta * (T - (ti - timestamps_s[0]))))
-        t_prev = ti
-
-    ll = -mu * T - (alpha / beta) * compensator + ll_data
-    return ll
-
-
-def hawkes_fit(timestamps_ms):
-    """Fit mu, alpha, beta via Nelder-Mead MLE. timestamps_ms sorted ascending."""
-    n = len(timestamps_ms)
-    if n < 10:
-        # flat Poisson fallback
-        return {"mu": 0.1, "alpha": 0.0, "beta": 1.0, "converged": False}
-
-    t_s = (timestamps_ms - timestamps_ms[0]).astype(np.float64) / 1000.0
-    T = t_s[-1]
-    if T <= 0:
-        return {"mu": 0.1, "alpha": 0.0, "beta": 1.0, "converged": False}
-
-    mu0 = 0.5 * n / T
-    alpha0 = 0.4 * n / T
-    beta0 = n / T
-
-    def neg_ll(params):
-        mu, alpha, beta = params
-        if mu <= 0 or alpha <= 0 or beta <= 0 or alpha >= beta:
-            return 1e10
-        ll = hawkes_log_likelihood(t_s, mu, alpha, beta)
-        if not np.isfinite(ll):
-            return 1e10
-        return -ll
-
-    result = minimize(neg_ll, x0=[mu0, alpha0, beta0], method="Nelder-Mead",
-                       options={"maxiter": 1000, "xatol": 1e-8, "fatol": 1e-8})
-
-    mu, alpha, beta = result.x
-    converged = result.success and alpha < beta and mu > 0 and alpha > 0 and beta > 0
-
-    return {"mu": max(mu, 1e-6), "alpha": max(alpha, 0.0), "beta": max(beta, 1e-6),
-            "converged": converged, "branching": alpha / beta if beta > 0 else np.inf}
+        t_start, t_end = bar_open_ms[i], bar_close_ms[i]
+        while left < len(times_ms) and times_ms[left] < t_start:
+            left += 1
+        right = left
+        while right < len(times_ms) and times_ms[right] < t_end:
+            right += 1
+        local = times_ms[left:right]
+        if len(local) >= 2:
+            times_s = local.astype(np.float64) / 1000.0
+            dts = np.diff(times_s)
+            dts = dts[dts > 0]
+            if len(dts) > 0:
+                rates[i] = np.mean(1.0 / dts)
+    return rates
 
 
-def hawkes_peak_lambda(timestamps_s, mu, alpha, beta):
-    """Max lambda(t_i) over the window, O(n) recursive."""
-    n = len(timestamps_s)
-    if n == 0:
-        return mu
-    A = 0.0
-    peak = mu
-    t_prev = timestamps_s[0]
+def rolling_zscore(series, lookback=Z_LOOKBACK):
+    n = len(series)
+    z = np.zeros(n)
     for i in range(n):
-        ti = timestamps_s[i]
-        if i > 0:
-            A = np.exp(-beta * (ti - t_prev)) * (1 + A)
-        lam = mu + alpha * A
-        peak = max(peak, lam)
-        t_prev = ti
-    return peak
-
-
-def sigmoid_ratio(ratio, center=2.0, steepness=2.0):
-    return 1.0 / (1.0 + np.exp(-(ratio - center) * steepness))
-
-
-def hawkes_anomaly_score(window_times_ms, mu, alpha, beta, window_duration_s=None):
-    """Matches volume-anomaly's score_hawkes: max(intensityScore, rateScore)."""
-    branching = alpha / beta if beta > 0 else np.inf
-    if branching >= 1:
-        return 1.0  # supercritical -> unconditional flag
-
-    t_s = window_times_ms.astype(np.float64) / 1000.0
-    mean_lambda = mu / (1 - branching)
-    peak_lambda = hawkes_peak_lambda(t_s, mu, alpha, beta)
-    intensity_score = sigmoid_ratio(peak_lambda / mean_lambda)
-
-    rate_score = 0.0
-    if window_duration_s and window_duration_s > 0 and mu > 0:
-        n = len(window_times_ms)
-        empirical_rate = n / window_duration_s
-        rate_score = sigmoid_ratio(empirical_rate / mu)
-
-    return max(intensity_score, rate_score)
-
-
-# --------------------------------------------------------------------------
-# Sliding window scan -> flagged candles
-# --------------------------------------------------------------------------
-def scan_and_flag(trade_times_ms, kline_df, train_n=TRAIN_TRADES,
-                   recent_n=RECENT_WINDOW, step=STEP, threshold=SCORE_THRESHOLD):
-
-    if len(trade_times_ms) < train_n + recent_n:
-        train_n = max(10, len(trade_times_ms) // 3)
-        print(f"   Not enough trades for configured TRAIN_TRADES, using {train_n}")
-
-    historical = trade_times_ms[:train_n]
-    print(f"   Fitting Hawkes on {len(historical)} historical trades...")
-    fit = hawkes_fit(historical)
-    print(f"   mu={fit['mu']:.4f} alpha={fit['alpha']:.4f} beta={fit['beta']:.4f} "
-          f"branching={fit.get('branching', 0):.3f} converged={fit['converged']}")
-
-    mu, alpha, beta = fit["mu"], fit["alpha"], fit["beta"]
-
-    open_ms = (kline_df["open_time"].astype(np.int64) // 1_000_000).values
-    flagged = {}  # {candle_index: peak_score}
-
-    i = train_n
-    n_trades = len(trade_times_ms)
-    while i + recent_n <= n_trades:
-        window = trade_times_ms[i:i + recent_n]
-        duration_s = (window[-1] - window[0]) / 1000.0
-        score = hawkes_anomaly_score(window, mu, alpha, beta, window_duration_s=duration_s)
-
-        if score >= threshold:
-            # map window's time span onto every candle it overlaps
-            w_start, w_end = window[0], window[-1]
-            start_idx = np.searchsorted(open_ms, w_start, side="right") - 1
-            end_idx = np.searchsorted(open_ms, w_end, side="right") - 1
-            for idx in range(max(start_idx, 0), min(end_idx, len(kline_df) - 1) + 1):
-                if idx not in flagged or score > flagged[idx]:
-                    flagged[idx] = score
-
-        i += step
-
-    return flagged, fit
+        window = series[max(0, i - lookback + 1): i + 1]
+        if len(window) < 5:
+            continue
+        mean = np.mean(window)
+        std = np.std(window)
+        if std > 1e-12:
+            z[i] = (series[i] - mean) / std
+    return z
 
 
 # --------------------------------------------------------------------------
 # Chart
 # --------------------------------------------------------------------------
-def create_chart(kline_df, flagged_full, fit):
+def create_chart(kline_df, buy_rate, sell_rate, z_scores):
     display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
-    offset = len(kline_df) - len(display_df)
-    flagged = {idx - offset: s for idx, s in flagged_full.items()
-               if 0 <= idx - offset < len(display_df)}
+    n = len(display_df)
+    b_rate = buy_rate[-n:]
+    s_rate = sell_rate[-n:]
+    z = z_scores[-n:]
 
-    volumes = display_df["volume"].astype(float).values
+    fig = plt.figure(figsize=(18, 10), facecolor="black")
+    gs = fig.add_gridspec(2, 1, height_ratios=[2.8, 1.4], hspace=0.07)
+    ax_candle = fig.add_subplot(gs[0])
+    ax_rate = fig.add_subplot(gs[1], sharex=ax_candle)
 
-    fig, ax_candle = plt.subplots(figsize=(18, 8), facecolor="black")
-    ax_candle.set_facecolor("black")
-    ax_candle.tick_params(colors="white")
-    for spine in ax_candle.spines.values():
-        spine.set_color("white")
+    for ax in [ax_candle, ax_rate]:
+        ax.set_facecolor("black")
+        ax.tick_params(colors="white")
+        for spine in ax.spines.values():
+            spine.set_color("white")
 
+    # Candles
     width = 0.6
     for idx, row in display_df.iterrows():
         color = "#00ff88" if row["close"] >= row["open"] else "#ff4466"
@@ -268,36 +166,41 @@ def create_chart(kline_df, flagged_full, fit):
                           facecolor=color, edgecolor=color)
         ax_candle.add_patch(rect)
 
-    for idx, score in flagged.items():
-        high = display_df["high"].iloc[idx]
-        span = display_df["high"].max() - display_df["low"].min()
-        y = high + span * 0.02
-        ax_candle.plot(idx, y, marker="*", color="#ffdd00", markersize=14, zorder=5)
-        ax_candle.text(idx, y + span * 0.015, f"{score:.2f}", color="#ffdd00",
-                        fontsize=7, ha="center", zorder=5)
+    # star flag on candles where z >= threshold
+    span = display_df["high"].max() - display_df["low"].min()
+    for idx in range(n):
+        if z[idx] >= Z_THRESHOLD:
+            y = display_df["high"].iloc[idx] + span * 0.02
+            ax_candle.plot(idx, y, marker="*", color="#ffdd00", markersize=12, zorder=5)
 
-    ax_candle.set_xlim(-1, len(display_df))
-    branching = fit.get("branching", alpha_beta_ratio(fit))
+    ax_candle.set_xlim(-1, n)
     ax_candle.set_title(
-        f"{SYMBOL} 1m  |  Hawkes MLE-fit  |  μ={fit['mu']:.3f} α={fit['alpha']:.3f} "
-        f"β={fit['beta']:.3f} (n={branching:.2f})\n"
-        f"Flagged candles: {len(flagged)}  |  window={RECENT_WINDOW} trades, step={STEP}  |  "
-        f"threshold={SCORE_THRESHOLD}",
-        color="white", fontsize=12, pad=10
+        f"{SYMBOL} 1m  |  Arrival Rate Panel  |  z lookback={Z_LOOKBACK}  threshold={Z_THRESHOLD}σ",
+        color="white", fontsize=12, pad=8
     )
     ax_candle.grid(True, color="#333333", alpha=0.4)
+    plt.setp(ax_candle.get_xticklabels(), visible=False)
 
-    ax_vol = ax_candle.twinx()
-    ax_vol.bar(range(len(display_df)), volumes, color="#4488ff", width=0.65, alpha=0.2, zorder=0)
-    ax_vol.set_ylabel("Volume", color="#4488ff")
-    ax_vol.tick_params(axis="y", colors="#4488ff")
-    ax_vol.spines["right"].set_color("#4488ff")
-    ax_vol.set_ylim(0, volumes.max() * 4 if len(volumes) and volumes.max() > 0 else 1)
+    # Rate panel: green up = buy rate, red down = sell rate
+    ax_rate.bar(range(n), b_rate, color="#00ff88", width=0.65, alpha=0.85, zorder=2)
+    ax_rate.bar(range(n), -s_rate, color="#ff4466", width=0.65, alpha=0.85, zorder=2)
+    ax_rate.axhline(0, color="white", linewidth=0.8, alpha=0.6)
+    ax_rate.set_ylabel("Arrival rate (trades/sec)", color="white", fontsize=9)
+    ax_rate.grid(True, color="#333333", alpha=0.4)
 
-    step_n = max(1, len(display_df) // 12)
-    ax_candle.set_xticks(range(0, len(display_df), step_n))
-    labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, len(display_df), step_n)]
-    ax_candle.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
+    # z-score line on twin axis
+    ax_z = ax_rate.twinx()
+    ax_z.plot(range(n), z, color="#ffdd00", linewidth=1.2, zorder=4)
+    ax_z.axhline(Z_THRESHOLD, color="#ffdd00", linewidth=0.7, linestyle="--", alpha=0.6)
+    ax_z.axhline(-Z_THRESHOLD, color="#ffdd00", linewidth=0.7, linestyle="--", alpha=0.3)
+    ax_z.set_ylabel("Z-score", color="#ffdd00", fontsize=9)
+    ax_z.tick_params(axis="y", colors="#ffdd00")
+    ax_z.spines["right"].set_color("#ffdd00")
+
+    step = max(1, n // 12)
+    ax_rate.set_xticks(range(0, n, step))
+    labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, n, step)]
+    ax_rate.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
 
     plt.tight_layout()
     buf = io.BytesIO()
@@ -305,10 +208,6 @@ def create_chart(kline_df, flagged_full, fit):
     buf.seek(0)
     plt.close()
     return buf.getvalue()
-
-
-def alpha_beta_ratio(fit):
-    return fit["alpha"] / fit["beta"] if fit["beta"] > 0 else float("inf")
 
 
 # --------------------------------------------------------------------------
@@ -319,7 +218,7 @@ async def send_photo(photo_bytes, caption=""):
     data = aiohttp.FormData()
     data.add_field("chat_id", str(CHAT_ID))
     data.add_field("caption", caption)
-    data.add_field("photo", photo_bytes, filename="hawkes_mle.png", content_type="image/png")
+    data.add_field("photo", photo_bytes, filename="arrival_rate.png", content_type="image/png")
     async with aiohttp.ClientSession() as session:
         async with session.post(url, data=data, timeout=60) as resp:
             text = await resp.text()
@@ -337,31 +236,44 @@ async def main():
     try:
         print("1. Fetching klines...")
         async with aiohttp.ClientSession() as session:
-            kline_df = await fetch_klines(session, SYMBOL, VISIBLE_CANDLES + 60)
+            kline_df = await fetch_klines(session, SYMBOL, VISIBLE_CANDLES + 5)
             print(f"   Got {len(kline_df)} klines")
 
             start_ms = int(kline_df["open_time"].iloc[0].timestamp() * 1000)
             end_ms = int(kline_df["open_time"].iloc[-1].timestamp() * 1000) + 60_000
 
-            print("2. Fetching full trade tape...")
-            trade_times = await fetch_all_trade_times(session, SYMBOL, start_ms, end_ms)
+            print("2. Fetching full trade tape (buy/sell tagged)...")
+            trade_times, is_buyer_maker = await fetch_all_agg_trades(session, SYMBOL, start_ms, end_ms)
 
-        print("3. Fitting Hawkes + scanning sliding windows...")
-        flagged, fit = scan_and_flag(trade_times, kline_df)
-        print(f"   {len(flagged)} candles flagged")
+        buy_times = trade_times[~is_buyer_maker]   # taker bought = BUY aggression
+        sell_times = trade_times[is_buyer_maker]   # taker sold = SELL aggression
+        print(f"   Buys: {len(buy_times):,}  Sells: {len(sell_times):,}")
 
-        print("4. Creating chart...")
-        photo = create_chart(kline_df, flagged, fit)
+        bar_open_ms = np.array(
+            [int(ts.timestamp() * 1000) for ts in kline_df["open_time"]], dtype=np.int64
+        )
+        bar_close_ms = bar_open_ms + 60_000
+
+        print("3. Computing per-candle arrival rates...")
+        buy_rate = compute_candle_arrival_rate(buy_times, bar_open_ms, bar_close_ms)
+        sell_rate = compute_candle_arrival_rate(sell_times, bar_open_ms, bar_close_ms)
+        total_rate = compute_candle_arrival_rate(trade_times, bar_open_ms, bar_close_ms)
+
+        print("4. Computing rolling z-score...")
+        z_scores = rolling_zscore(total_rate, lookback=Z_LOOKBACK)
+        n_flagged = int(np.sum(z_scores >= Z_THRESHOLD))
+        print(f"   {n_flagged} candles with z >= {Z_THRESHOLD}")
+
+        print("5. Creating chart...")
+        photo = create_chart(kline_df, buy_rate, sell_rate, z_scores)
         print(f"   Chart size: {len(photo)/1024:.1f} KB")
 
-        caption = (f"{SYMBOL} – Hawkes MLE anomaly scan\n"
-                   f"μ={fit['mu']:.3f} α={fit['alpha']:.3f} β={fit['beta']:.3f} "
-                   f"(n={alpha_beta_ratio(fit):.2f})\n"
-                   f"{len(flagged)} candles flagged | threshold {SCORE_THRESHOLD}")
+        caption = (f"{SYMBOL} – Arrival Rate Panel\n"
+                   f"z lookback={Z_LOOKBACK} | threshold={Z_THRESHOLD}σ | {n_flagged} flagged")
 
-        print("5. Sending...")
+        print("6. Sending...")
         await send_photo(photo, caption)
-        print("6. Done.")
+        print("7. Done.")
 
     except Exception as e:
         print("ERROR:", str(e))
