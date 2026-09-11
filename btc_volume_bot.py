@@ -1,421 +1,299 @@
 #!/usr/bin/env python3
 """
-Volume Z-Score Bot + HTF Structure Filter
-- Simple alerts: only "SYMBOL  COLOR"
-- Each color has independent cooldown (set only when alert is sent)
-- Green candle → needs any HTF Bearish
-- Red candle → needs any HTF Bullish
+Outlier Trades Chart → Hawkes version
+- Same structure as your original script
+- Every trade is an event
+- Hawkes intensity at each bar close
+- Rolling z-score of intensity over last CALC_LOOKBACK bars
+- Same candles + lower panel style, same Telegram send
 """
 
 import asyncio
-import json
-import statistics
-from collections import defaultdict, deque
-from typing import Deque, Dict, List, Optional, Set, Tuple
+import io
+import traceback
 
 import aiohttp
-import websockets
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.patches import Rectangle
 
-# ==========================================================================
+# --------------------------------------------------------------------------
 # CONFIG
-# ==========================================================================
-BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"  # rotate this
-CHAT_ID   = "6263967739"
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+# --------------------------------------------------------------------------
+SYMBOL = "BTCUSDT"
 
-# Volume Z-Score settings
-TIMEFRAME   = "5m"          # change to "1m" if you want
-Z_LENGTH    = 1000
-ALERT_Z_MIN = 1.5
+VISIBLE_CANDLES = 200
+CALC_LOOKBACK = 30          # same as your original
+STD_MULT = 2.0
 
-LEVELS = [
-    (6.0, "red",    "🔴 "),
-    (4.5, "orange", "🟠 "),
-    (3.0, "yellow", "🟡 "),
-    (1.5, "green",  "🟢 "),
-]
+# Hawkes parameters (seconds)
+MU = 0.05
+ALPHA = 0.8
+BETA = 0.15
 
-# Coin selection
-MIN_24H_VOLUME      = 50_000_000
-MAX_SYMBOLS         = 10
-VOLATILITY_LOOKBACK = 21
-MIN_CANDLE_MOVE_PCT = 0.01
-REFRESH_INTERVAL    = 3600          # 1 hour
+BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
+CHAT_ID = "6263967739"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-HTF_LIST = ["5m", "15m", "1h", "4h"]
+# --------------------------------------------------------------------------
+# Fetch Klines  (identical to your original)
+# --------------------------------------------------------------------------
+async def fetch_klines(session, symbol, total_needed):
+    all_data = []
+    remaining = total_needed
+    end_time = None
 
-# ==========================================================================
-# STATE
-# ==========================================================================
-volumes: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=Z_LENGTH))
+    while remaining > 0:
+        limit = min(1500, remaining)
+        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}"
+        if end_time:
+            url += f"&endTime={end_time}"
 
-cooldown: Dict[str, Dict[str, bool]] = defaultdict(lambda: {
-    "red": False, "orange": False, "yellow": False, "green": False
-})
+        async with session.get(url, timeout=15) as resp:
+            data = await resp.json()
 
-structure = defaultdict(lambda: defaultdict(lambda: {
-    "sup": None, "res": None, "state": "neutral",
-    "prev_green": None, "prev_red": None,
-    "last_high": None, "last_low": None
-}))
+        if not data:
+            break
 
-active_symbols: Set[str] = set()
-listener_tasks: Dict[str, asyncio.Task] = {}
-_http_session: Optional[aiohttp.ClientSession] = None
+        all_data = data + all_data
+        remaining -= len(data)
+        end_time = data[0][0] - 1
 
+        if len(data) < limit:
+            break
+        await asyncio.sleep(0.2)
 
-# ==========================================================================
-# TELEGRAM
-# ==========================================================================
-async def send_telegram(text: str):
-    global _http_session
-    try:
-        if _http_session is None or _http_session.closed:
-            _http_session = aiohttp.ClientSession()
-        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-        async with _http_session.post(TELEGRAM_API_URL, json=payload, timeout=10) as resp:
-            if resp.status != 200:
-                print(f"[TG] Error {resp.status}: {await resp.text()}")
-    except Exception as e:
-        print(f"[TG] Exception: {e}")
+    df = pd.DataFrame(all_data, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore"
+    ])
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+    return df.drop_duplicates(subset=["open_time"]).reset_index(drop=True)
 
 
-# ==========================================================================
-# SUPPORT / RESISTANCE STRUCTURE
-# ==========================================================================
-def update_structure(symbol: str, tf: str, o: float, h: float, l: float, c: float, is_closed: bool) -> bool:
-    s = structure[symbol][tf]
+# --------------------------------------------------------------------------
+# Fetch ALL trade timestamps (instead of only largest)
+# --------------------------------------------------------------------------
+async def fetch_all_trade_times(session, symbol, start_ms, end_ms):
+    times = []
+    current_start = start_ms
 
-    green = c > o
-    red = c < o
+    print("   Fetching aggTrades...")
+    while current_start < end_ms:
+        url = (f"https://fapi.binance.com/fapi/v1/aggTrades"
+               f"?symbol={symbol}&startTime={current_start}&endTime={end_ms}&limit=1000")
 
-    prev_green = s.get("prev_green")
-    prev_red = s.get("prev_red")
+        async with session.get(url, timeout=15) as resp:
+            trades = await resp.json()
 
-    green_to_red = prev_green and red
-    red_to_green = prev_red and green
+        if not trades or not isinstance(trades, list):
+            break
 
-    if green_to_red:
-        s["res"] = max(h, s.get("last_high") or h)
-    if red_to_green:
-        s["sup"] = min(l, s.get("last_low") or l)
+        for t in trades:
+            times.append(t["T"])
 
-    if red and not green_to_red and s["res"] is not None and h > s["res"]:
-        s["res"] = h
-    if green and not red_to_green and s["sup"] is not None and l < s["sup"]:
-        s["sup"] = l
+        if len(trades) < 1000:
+            break
 
-    if s["sup"] is not None and l < s["sup"] and c > s["sup"]:
-        s["sup"] = l
+        current_start = trades[-1]["T"] + 1
+        await asyncio.sleep(0.12)
 
-    if is_closed:
-        old_state = s["state"]
-
-        if s["res"] is not None and c > s["res"]:
-            s["state"] = "bullish"
-            s["res"] = None
-        elif s["sup"] is not None and c < s["sup"]:
-            s["state"] = "bearish"
-            s["sup"] = None
-
-        s["prev_green"] = green
-        s["prev_red"] = red
-        s["last_high"] = h
-        s["last_low"] = l
-        return old_state != s["state"]
-
-    s["prev_green"] = green
-    s["prev_red"] = red
-    s["last_high"] = h
-    s["last_low"] = l
-    return False
+    times.sort()
+    return times
 
 
-async def get_htf_states(symbol: str) -> Dict[str, str]:
-    results = {}
-    async with aiohttp.ClientSession() as session:
-        for tf in HTF_LIST:
-            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={tf}&limit=12"
-            try:
-                async with session.get(url, timeout=8) as resp:
-                    data = await resp.json()
-                    if not isinstance(data, list) or not data:
-                        results[tf] = "neutral"
-                        continue
+# --------------------------------------------------------------------------
+# Hawkes intensity (recursive)
+# then rolling z-score exactly like your original mean/std logic
+# --------------------------------------------------------------------------
+def compute_hawkes_intensities(trade_times_ms, bar_close_ms,
+                               mu=MU, alpha=ALPHA, beta=BETA):
+    if not trade_times_ms:
+        return [mu] * len(bar_close_ms)
 
-                    for candle in data[:-1]:
-                        o = float(candle[1])
-                        h = float(candle[2])
-                        l = float(candle[3])
-                        c = float(candle[4])
-                        update_structure(symbol, tf, o, h, l, c, is_closed=True)
+    trade_t = np.array(trade_times_ms, dtype=np.float64) / 1000.0
+    bar_t   = np.array(bar_close_ms, dtype=np.float64) / 1000.0
 
-                    results[tf] = structure[symbol][tf]["state"]
-            except Exception as e:
-                print(f"[HTF] {symbol} {tf} error: {e}")
-                results[tf] = "neutral"
-    return results
+    intensities = []
+    trade_idx = 0
+    n_trades = len(trade_t)
+
+    current_time = min(trade_t[0], bar_t[0]) - 1.0
+    current_lambda = mu
+
+    for b_close in bar_t:
+        while trade_idx < n_trades and trade_t[trade_idx] <= b_close:
+            dt = trade_t[trade_idx] - current_time
+            if dt > 0:
+                current_lambda = mu + (current_lambda - mu) * np.exp(-beta * dt)
+            current_lambda += alpha
+            current_time = trade_t[trade_idx]
+            trade_idx += 1
+
+        dt = b_close - current_time
+        if dt > 0:
+            current_lambda = mu + (current_lambda - mu) * np.exp(-beta * dt)
+            current_time = b_close
+
+        intensities.append(max(current_lambda, 0.0))
+
+    return intensities
 
 
-# ==========================================================================
-# Z-SCORE
-# ==========================================================================
-def calc_zscore(vols: Deque[float]) -> Optional[float]:
-    if len(vols) < 2:
-        return None
-    try:
-        avg = statistics.mean(vols)
-        std = statistics.stdev(vols)
+# --------------------------------------------------------------------------
+# Create Chart  (kept as close as possible to your original)
+# --------------------------------------------------------------------------
+def create_chart(kline_df, intensities):
+    display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
+    display_intensities = intensities[-VISIBLE_CANDLES:]
+
+    bar_values = []
+    bar_colors = []
+
+    for i in range(len(display_df)):
+        # rolling window of intensities (exactly like your original mean/std)
+        window = display_intensities[max(0, i - CALC_LOOKBACK + 1): i + 1]
+
+        if len(window) < 5:
+            bar_values.append(0)
+            bar_colors.append("#555555")
+            continue
+
+        mean = np.mean(window)
+        std = np.std(window)
         if std == 0:
-            return 0.0
-        return (vols[-1] - avg) / std
-    except statistics.StatisticsError:
-        return None
+            bar_values.append(0)
+            bar_colors.append("#555555")
+            continue
 
+        z = (display_intensities[i] - mean) / std
 
-def get_level(z: float) -> Optional[Tuple[float, str, str]]:
-    for thresh, color, label in LEVELS:
-        if z >= thresh:
-            return thresh, color, label
-    return None
+        # only show the bar when it is an outlier (same spirit as original)
+        if abs(z) >= STD_MULT:
+            bar_values.append(z)
+            bar_colors.append("#00ff88" if z > 0 else "#ff4466")
+        else:
+            bar_values.append(0)
+            bar_colors.append("#555555")
 
+    # ---------- Plot ----------
+    fig = plt.figure(figsize=(18, 10), facecolor="black")
+    gs = fig.add_gridspec(2, 1, height_ratios=[2.8, 1.4], hspace=0.07)
 
-# ==========================================================================
-# HISTORICAL LOAD
-# ==========================================================================
-async def load_historical(session: aiohttp.ClientSession, symbol: str) -> bool:
-    url = (
-        f"https://fapi.binance.com/fapi/v1/klines"
-        f"?symbol={symbol}&interval={TIMEFRAME}&limit={Z_LENGTH + 1}"
+    ax_candle = fig.add_subplot(gs[0])
+    ax_out = fig.add_subplot(gs[1], sharex=ax_candle)
+
+    for ax in [ax_candle, ax_out]:
+        ax.set_facecolor("black")
+        ax.tick_params(colors="white")
+        for spine in ax.spines.values():
+            spine.set_color("white")
+
+    # Candlesticks (identical)
+    width = 0.6
+    for idx, row in display_df.iterrows():
+        color = "#00ff88" if row["close"] >= row["open"] else "#ff4466"
+        ax_candle.plot([idx, idx], [row["low"], row["high"]], color=color, linewidth=0.7)
+        body_low = min(row["open"], row["close"])
+        body_height = abs(row["close"] - row["open"]) or 0.01
+        rect = Rectangle((idx - width/2, body_low), width, body_height,
+                         facecolor=color, edgecolor=color)
+        ax_candle.add_patch(rect)
+
+    ax_candle.set_xlim(-1, VISIBLE_CANDLES)
+    ax_candle.set_title(
+        f"{SYMBOL} 1m  |  Visible: {VISIBLE_CANDLES}  |  Lookback: {CALC_LOOKBACK}  |  Std: {STD_MULT}σ\n"
+        f"Hawkes Intensity Z-Score  |  Green = elevated  |  Red = suppressed",
+        color="white", fontsize=12, pad=8
     )
-    try:
-        async with session.get(url, timeout=12) as resp:
-            data = await resp.json()
-            if not isinstance(data, list) or len(data) < 10:
-                return False
+    ax_candle.grid(True, color="#333333", alpha=0.4)
+    plt.setp(ax_candle.get_xticklabels(), visible=False)
 
-            closed = data[:-1]
-            vols = [float(c[5]) for c in closed]
-            volumes[symbol].clear()
-            volumes[symbol].extend(vols[-Z_LENGTH:])
-            print(f"[HIST] {symbol} loaded {len(volumes[symbol])} bars")
-            return True
-    except Exception as e:
-        print(f"[HIST] {symbol} failed: {e}")
-        return False
+    # Bars (same style as original)
+    ax_out.bar(range(len(display_df)), bar_values, color=bar_colors, width=0.65, alpha=0.85)
+    ax_out.axhline(0, color="white", linewidth=0.8, alpha=0.5)
 
+    ax_out.set_ylabel("Hawkes Z-Score", color="white")
+    ax_out.grid(True, color="#333333", alpha=0.4)
 
-# ==========================================================================
-# COIN SELECTION
-# ==========================================================================
-async def has_volatile_15m(session: aiohttp.ClientSession, symbol: str) -> bool:
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit={VOLATILITY_LOOKBACK + 1}"
-    try:
-        async with session.get(url, timeout=8) as resp:
-            data = await resp.json()
-            if not isinstance(data, list) or len(data) < 2:
-                return False
-            for candle in data[:-1]:
-                o = float(candle[1])
-                c = float(candle[4])
-                if o > 0 and abs(c - o) / o >= MIN_CANDLE_MOVE_PCT:
-                    return True
-            return False
-    except Exception:
-        return False
+    step = max(1, VISIBLE_CANDLES // 12)
+    ax_out.set_xticks(range(0, VISIBLE_CANDLES, step))
+    labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, VISIBLE_CANDLES, step)]
+    ax_out.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
+
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=120, facecolor="black", edgecolor="none")
+    buf.seek(0)
+    plt.close()
+    return buf.getvalue()
 
 
-async def select_symbols() -> List[str]:
-    print("[SELECT] Fetching 24h tickers...")
+# --------------------------------------------------------------------------
+# Send Photo (identical)
+# --------------------------------------------------------------------------
+async def send_photo(photo_bytes, caption=""):
+    url = f"{TELEGRAM_API_URL}/sendPhoto"
+    data = aiohttp.FormData()
+    data.add_field("chat_id", str(CHAT_ID))
+    data.add_field("caption", caption)
+    data.add_field("photo", photo_bytes, filename="hawkes_outlier.png", content_type="image/png")
+
     async with aiohttp.ClientSession() as session:
-        async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15) as resp:
-            tickers = await resp.json()
-
-        if not isinstance(tickers, list):
-            return []
-
-        candidates = []
-        for t in tickers:
-            sym = t.get("symbol", "")
-            if not sym.endswith("USDT"):
-                continue
-            try:
-                vol = float(t.get("quoteVolume", 0))
-            except (TypeError, ValueError):
-                continue
-            if vol >= MIN_24H_VOLUME:
-                candidates.append((sym, vol))
-
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        print(f"[SELECT] {len(candidates)} coins ≥ {MIN_24H_VOLUME/1e6:.0f}M")
-
-        selected = []
-        for sym, vol in candidates:
-            if len(selected) >= MAX_SYMBOLS:
-                break
-            if await has_volatile_15m(session, sym):
-                selected.append(sym)
-                print(f"[SELECT] ✅ {sym}  {vol/1e6:.1f}M")
+        async with session.post(url, data=data, timeout=60) as resp:
+            text = await resp.text()
+            print(f"Telegram status: {resp.status}")
+            if resp.status == 200:
+                print("Photo sent successfully!")
             else:
-                print(f"[SELECT] ❌ {sym}")
-
-        return selected
+                print("Failed:", text[:300])
 
 
-# ==========================================================================
-# WEBSOCKET LISTENER
-# ==========================================================================
-async def kline_listener(symbol: str):
-    stream = f"{symbol.lower()}@kline_{TIMEFRAME}"
-    url = f"wss://fstream.binance.com/market/ws/{stream}"
-
-    backoff = 2
-    while symbol in active_symbols:
-        try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=12) as ws:
-                print(f"[WS] Connected {symbol} {TIMEFRAME}")
-                backoff = 2
-
-                async for raw in ws:
-                    if symbol not in active_symbols:
-                        break
-                    try:
-                        msg = json.loads(raw)
-                        k = msg["k"]
-                        if not k["x"]:
-                            continue
-
-                        o = float(k["o"])
-                        c = float(k["c"])
-                        vol = float(k["v"])
-
-                        volumes[symbol].append(vol)
-                        z = calc_zscore(volumes[symbol])
-                        if z is None:
-                            continue
-
-                        # Reset all cooldowns on Gray / Navy
-                        if z < ALERT_Z_MIN:
-                            for color in list(cooldown[symbol].keys()):
-                                if cooldown[symbol][color]:
-                                    print(f"[RESET] {symbol} {color} cleared (Z={z:.2f})")
-                                cooldown[symbol][color] = False
-                            continue
-
-                        level = get_level(z)
-                        if level is None:
-                            continue
-
-                        _, color, label = level
-
-                        # Already on cooldown for this specific color?
-                        if cooldown[symbol][color]:
-                            continue
-
-                        # ========== HTF FILTER ==========
-                        is_green = c > o
-                        is_red = c < o
-
-                        htf_states = await get_htf_states(symbol)
-
-                        any_bearish = any(st == "bearish" for st in htf_states.values())
-                        any_bullish = any(st == "bullish" for st in htf_states.values())
-
-                        allowed = False
-                        if is_green and any_bearish:
-                            allowed = True
-                        elif is_red and any_bullish:
-                            allowed = True
-
-                        if not allowed:
-                            print(f"[FILTER] {symbol} {label} blocked by HTF")
-                            continue
-
-                        # ===== SEND ALERT (only here) =====
-                        cooldown[symbol][color] = True
-                        alert_msg = f"<b>{symbol}</b>  {label}"
-                        print(f"[ALERT] {symbol} {label}")
-                        await send_telegram(alert_msg)
-
-                    except Exception as e:
-                        print(f"[WS] Parse error {symbol}: {e}")
-
-        except Exception as e:
-            if symbol not in active_symbols:
-                break
-            print(f"[WS] {symbol} disconnected: {e} → retry in {backoff}s")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-
-    print(f"[WS] Stopped {symbol}")
-
-
-# ==========================================================================
-# SYMBOL MANAGER
-# ==========================================================================
-async def refresh_symbols():
-    global active_symbols, listener_tasks
-
-    new_list = await select_symbols()
-    new_set = set(new_list)
-
-    # Remove old
-    for sym in list(active_symbols - new_set):
-        active_symbols.discard(sym)
-        task = listener_tasks.pop(sym, None)
-        if task and not task.done():
-            task.cancel()
-        volumes.pop(sym, None)
-        cooldown.pop(sym, None)
-        structure.pop(sym, None)
-        print(f"[MGR] Removed {sym}")
-
-    # Add new
-    async with aiohttp.ClientSession() as session:
-        for sym in new_set - active_symbols:
-            ok = await load_historical(session, sym)
-            if not ok:
-                print(f"[MGR] Skipping {sym}")
-                continue
-            active_symbols.add(sym)
-            listener_tasks[sym] = asyncio.create_task(kline_listener(sym))
-            print(f"[MGR] Started {sym}")
-
-    if new_list:
-        await send_telegram(
-            "🔄 <b>Active coins updated</b>\n" +
-            "\n".join(f"• {s}" for s in new_list)
-        )
-    else:
-        await send_telegram("⚠️ No coins passed the filters")
-
-
-async def symbol_refresher():
-    while True:
-        try:
-            await refresh_symbols()
-        except Exception as e:
-            print(f"[REFRESH] {e}")
-            await send_telegram(f"⚠️ Refresh failed: {e}")
-        await asyncio.sleep(REFRESH_INTERVAL)
-
-
-# ==========================================================================
-# MAIN
-# ==========================================================================
+# --------------------------------------------------------------------------
+# MAIN (same flow as your original)
+# --------------------------------------------------------------------------
 async def main():
-    print("Volume Z-Score + HTF Filter Bot starting...")
-    await send_telegram(
-        f"Bot started ✅\n"
-        f"TF: {TIMEFRAME} | Max coins: {MAX_SYMBOLS}\n"
-        f"Simple alerts: SYMBOL + COLOR only"
-    )
-    await refresh_symbols()
-    await symbol_refresher()
+    try:
+        print("1. Fetching klines...")
+        async with aiohttp.ClientSession() as session:
+            kline_df = await fetch_klines(session, SYMBOL, VISIBLE_CANDLES + CALC_LOOKBACK + 30)
+            print(f"   Got {len(kline_df)} klines")
+
+            start_ms = int(kline_df["open_time"].iloc[0].timestamp() * 1000)
+            end_ms = int(kline_df["open_time"].iloc[-1].timestamp() * 1000) + 60_000
+
+            print("2. Fetching all trades...")
+            trade_times = await fetch_all_trade_times(session, SYMBOL, start_ms, end_ms)
+            print(f"   Got {len(trade_times)} trades")
+
+        bar_close_ms = [int(ts.timestamp() * 1000) + 60_000 for ts in kline_df["open_time"]]
+
+        print("3. Computing Hawkes intensities...")
+        intensities = compute_hawkes_intensities(trade_times, bar_close_ms)
+        print(f"   Intensity series ready")
+
+        print("4. Creating chart...")
+        photo = create_chart(kline_df, intensities)
+        print(f"   Chart size: {len(photo)/1024:.1f} KB")
+
+        caption = (f"{SYMBOL} – Hawkes Intensity Outliers\n"
+                   f"Visible: {VISIBLE_CANDLES}\n"
+                   f"Lookback: {CALC_LOOKBACK} | Std: {STD_MULT}σ\n"
+                   f"μ={MU} α={ALPHA} β={BETA}")
+
+        print("5. Sending...")
+        await send_photo(photo, caption)
+        print("6. Done.")
+
+    except Exception as e:
+        print("ERROR:", str(e))
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Stopped.")
+    asyncio.run(main())
