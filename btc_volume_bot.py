@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Trade arrival-rate panel: instantaneous inter-arrival rate per side (buy/sell),
-averaged per candle, plotted as mirrored green/red bars, with a rolling
-z-score line (lookback=30) of the combined rate overlaid.
+Arrival rate DELTA panel: buy_rate - sell_rate per candle, bars only.
+Green bar above zero = buys arriving faster than sells.
+Red bar below zero = sells arriving faster than buys.
+No lines, no z-score.
 """
 
 import asyncio
@@ -19,9 +20,7 @@ from matplotlib.patches import Rectangle
 # CONFIG
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
-VISIBLE_CANDLES = 200
-Z_LOOKBACK = 30
-Z_THRESHOLD = 2.0
+VISIBLE_CANDLES = 600
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
@@ -66,10 +65,7 @@ async def fetch_klines(session, symbol, total_needed):
 # Fetch ALL agg trades WITH buy/sell side
 # --------------------------------------------------------------------------
 async def fetch_all_agg_trades(session, symbol, start_ms, end_ms):
-    """Returns (times_ms, is_buyer_maker) sorted ascending.
-    isBuyerMaker=True  -> seller was the aggressor (SELL)
-    isBuyerMaker=False -> buyer was the aggressor (BUY)
-    """
+    """isBuyerMaker=True -> SELL aggressor. isBuyerMaker=False -> BUY aggressor."""
     times = []
     maker_flags = []
     current_start = start_ms
@@ -120,36 +116,20 @@ def compute_candle_arrival_rate(times_ms, bar_open_ms, bar_close_ms):
     return rates
 
 
-def rolling_zscore(series, lookback=Z_LOOKBACK):
-    n = len(series)
-    z = np.zeros(n)
-    for i in range(n):
-        window = series[max(0, i - lookback + 1): i + 1]
-        if len(window) < 5:
-            continue
-        mean = np.mean(window)
-        std = np.std(window)
-        if std > 1e-12:
-            z[i] = (series[i] - mean) / std
-    return z
-
-
 # --------------------------------------------------------------------------
 # Chart
 # --------------------------------------------------------------------------
-def create_chart(kline_df, buy_rate, sell_rate, z_scores):
+def create_chart(kline_df, delta):
     display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
     n = len(display_df)
-    b_rate = buy_rate[-n:]
-    s_rate = sell_rate[-n:]
-    z = z_scores[-n:]
+    d = delta[-n:]
 
     fig = plt.figure(figsize=(18, 10), facecolor="black")
     gs = fig.add_gridspec(2, 1, height_ratios=[2.8, 1.4], hspace=0.07)
     ax_candle = fig.add_subplot(gs[0])
-    ax_rate = fig.add_subplot(gs[1], sharex=ax_candle)
+    ax_delta = fig.add_subplot(gs[1], sharex=ax_candle)
 
-    for ax in [ax_candle, ax_rate]:
+    for ax in [ax_candle, ax_delta]:
         ax.set_facecolor("black")
         ax.tick_params(colors="white")
         for spine in ax.spines.values():
@@ -166,41 +146,25 @@ def create_chart(kline_df, buy_rate, sell_rate, z_scores):
                           facecolor=color, edgecolor=color)
         ax_candle.add_patch(rect)
 
-    # star flag on candles where z >= threshold
-    span = display_df["high"].max() - display_df["low"].min()
-    for idx in range(n):
-        if z[idx] >= Z_THRESHOLD:
-            y = display_df["high"].iloc[idx] + span * 0.02
-            ax_candle.plot(idx, y, marker="*", color="#ffdd00", markersize=12, zorder=5)
-
     ax_candle.set_xlim(-1, n)
     ax_candle.set_title(
-        f"{SYMBOL} 1m  |  Arrival Rate Panel  |  z lookback={Z_LOOKBACK}  threshold={Z_THRESHOLD}σ",
+        f"{SYMBOL} 1m  |  Arrival Rate Delta (buy - sell)",
         color="white", fontsize=12, pad=8
     )
     ax_candle.grid(True, color="#333333", alpha=0.4)
     plt.setp(ax_candle.get_xticklabels(), visible=False)
 
-    # Rate panel: green up = buy rate, red down = sell rate
-    ax_rate.bar(range(n), b_rate, color="#00ff88", width=0.65, alpha=0.85, zorder=2)
-    ax_rate.bar(range(n), -s_rate, color="#ff4466", width=0.65, alpha=0.85, zorder=2)
-    ax_rate.axhline(0, color="white", linewidth=0.8, alpha=0.6)
-    ax_rate.set_ylabel("Arrival rate (trades/sec)", color="white", fontsize=9)
-    ax_rate.grid(True, color="#333333", alpha=0.4)
-
-    # z-score line on twin axis
-    ax_z = ax_rate.twinx()
-    ax_z.plot(range(n), z, color="#ffdd00", linewidth=1.2, zorder=4)
-    ax_z.axhline(Z_THRESHOLD, color="#ffdd00", linewidth=0.7, linestyle="--", alpha=0.6)
-    ax_z.axhline(-Z_THRESHOLD, color="#ffdd00", linewidth=0.7, linestyle="--", alpha=0.3)
-    ax_z.set_ylabel("Z-score", color="#ffdd00", fontsize=9)
-    ax_z.tick_params(axis="y", colors="#ffdd00")
-    ax_z.spines["right"].set_color("#ffdd00")
+    # Delta panel: bars only, green above zero (buy faster), red below (sell faster)
+    bar_colors = ["#00ff88" if v >= 0 else "#ff4466" for v in d]
+    ax_delta.bar(range(n), d, color=bar_colors, width=0.65, alpha=0.9, zorder=2)
+    ax_delta.axhline(0, color="white", linewidth=0.8, alpha=0.6)
+    ax_delta.set_ylabel("Δ rate (trades/sec)", color="white", fontsize=9)
+    ax_delta.grid(True, color="#333333", alpha=0.4)
 
     step = max(1, n // 12)
-    ax_rate.set_xticks(range(0, n, step))
+    ax_delta.set_xticks(range(0, n, step))
     labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, n, step)]
-    ax_rate.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
+    ax_delta.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
 
     plt.tight_layout()
     buf = io.BytesIO()
@@ -218,7 +182,7 @@ async def send_photo(photo_bytes, caption=""):
     data = aiohttp.FormData()
     data.add_field("chat_id", str(CHAT_ID))
     data.add_field("caption", caption)
-    data.add_field("photo", photo_bytes, filename="arrival_rate.png", content_type="image/png")
+    data.add_field("photo", photo_bytes, filename="arrival_rate_delta.png", content_type="image/png")
     async with aiohttp.ClientSession() as session:
         async with session.post(url, data=data, timeout=60) as resp:
             text = await resp.text()
@@ -257,23 +221,17 @@ async def main():
         print("3. Computing per-candle arrival rates...")
         buy_rate = compute_candle_arrival_rate(buy_times, bar_open_ms, bar_close_ms)
         sell_rate = compute_candle_arrival_rate(sell_times, bar_open_ms, bar_close_ms)
-        total_rate = compute_candle_arrival_rate(trade_times, bar_open_ms, bar_close_ms)
+        delta = buy_rate - sell_rate
 
-        print("4. Computing rolling z-score...")
-        z_scores = rolling_zscore(total_rate, lookback=Z_LOOKBACK)
-        n_flagged = int(np.sum(z_scores >= Z_THRESHOLD))
-        print(f"   {n_flagged} candles with z >= {Z_THRESHOLD}")
-
-        print("5. Creating chart...")
-        photo = create_chart(kline_df, buy_rate, sell_rate, z_scores)
+        print("4. Creating chart...")
+        photo = create_chart(kline_df, delta)
         print(f"   Chart size: {len(photo)/1024:.1f} KB")
 
-        caption = (f"{SYMBOL} – Arrival Rate Panel\n"
-                   f"z lookback={Z_LOOKBACK} | threshold={Z_THRESHOLD}σ | {n_flagged} flagged")
+        caption = f"{SYMBOL} – Arrival Rate Delta (buy - sell), bars only"
 
-        print("6. Sending...")
+        print("5. Sending...")
         await send_photo(photo, caption)
-        print("7. Done.")
+        print("6. Done.")
 
     except Exception as e:
         print("ERROR:", str(e))
