@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Volume Z-Score Bot
-- Auto-selects top 10 high-volume + volatile USDT perpetuals
-- Loads 1000 historical candles → keeps rolling live lookback
-- Alerts on Green / Yellow / Orange / Red volume bars
-- Each color has its own cooldown (reset only by Gray or Navy bar)
+Volume Z-Score Bot + HTF Structure Filter
+- Alerts only on Green+ volume bars
+- Extra filter: Green candle only if any HTF is Bearish
+                 Red candle only if any HTF is Bullish
+- Each color has its own cooldown (reset by Gray/Navy)
 """
 
 import asyncio
@@ -12,7 +12,7 @@ import json
 import statistics
 import time
 from collections import defaultdict, deque
-from typing import Deque, Dict, List, Optional, Set
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import websockets
@@ -24,12 +24,11 @@ BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"  # rotate me
 CHAT_ID   = "6263967739"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-# Volume Z-Score settings (exactly matching the Pine Script)
-TIMEFRAME          = "1m"          # change to "1m", "15m", etc. if you want
+# Volume Z-Score
+TIMEFRAME          = "5m"
 Z_LENGTH           = 1000
-ALERT_Z_MIN        = 1.5           # green and above
+ALERT_Z_MIN        = 1.5
 
-# Color thresholds (highest first)
 LEVELS = [
     (6.0, "red",    "🔴 RED"),
     (4.5, "orange", "🟠 ORANGE"),
@@ -38,23 +37,30 @@ LEVELS = [
 ]
 
 # Coin selection
-MIN_24H_VOLUME     = 50_000_000    # 50M USDT
-MAX_SYMBOLS        = 10
+MIN_24H_VOLUME      = 50_000_000
+MAX_SYMBOLS         = 10
 VOLATILITY_LOOKBACK = 21
-MIN_CANDLE_MOVE_PCT = 0.01         # 1%
+MIN_CANDLE_MOVE_PCT = 0.01
+REFRESH_INTERVAL    = 3600
 
-REFRESH_INTERVAL   = 3600          # re-select coins every 1 hour
+# Higher timeframes for structure filter
+HTF_LIST = ["5m", "15m", "1h", "4h"]
 
 # ==========================================================================
 # STATE
 # ==========================================================================
-# volumes[symbol] = deque of the last Z_LENGTH closed volumes
 volumes: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=Z_LENGTH))
 
-# cooldown[symbol][color] = True if that color is currently on cooldown
 cooldown: Dict[str, Dict[str, bool]] = defaultdict(lambda: {
     "red": False, "orange": False, "yellow": False, "green": False
 })
+
+# structure[symbol][tf] = {"sup":..., "res":..., "state": "bullish"/"bearish"/"neutral", ...}
+structure = defaultdict(lambda: defaultdict(lambda: {
+    "sup": None, "res": None, "state": "neutral",
+    "prev_green": None, "prev_red": None,
+    "last_high": None, "last_low": None
+}))
 
 active_symbols: Set[str] = set()
 listener_tasks: Dict[str, asyncio.Task] = {}
@@ -78,7 +84,87 @@ async def send_telegram(text: str):
 
 
 # ==========================================================================
-# Z-SCORE MATH
+# SUPPORT / RESISTANCE STRUCTURE LOGIC (from your earlier bot)
+# ==========================================================================
+def update_structure(symbol: str, tf: str, o: float, h: float, l: float, c: float, is_closed: bool) -> bool:
+    s = structure[symbol][tf]
+
+    green = c > o
+    red = c < o
+
+    prev_green = s.get("prev_green")
+    prev_red = s.get("prev_red")
+
+    green_to_red = prev_green and red
+    red_to_green = prev_red and green
+
+    if green_to_red:
+        s["res"] = max(h, s.get("last_high") or h)
+    if red_to_green:
+        s["sup"] = min(l, s.get("last_low") or l)
+
+    if red and not green_to_red and s["res"] is not None and h > s["res"]:
+        s["res"] = h
+    if green and not red_to_green and s["sup"] is not None and l < s["sup"]:
+        s["sup"] = l
+
+    if s["sup"] is not None and l < s["sup"] and c > s["sup"]:
+        s["sup"] = l
+
+    if is_closed:
+        old_state = s["state"]
+
+        if s["res"] is not None and c > s["res"]:
+            s["state"] = "bullish"
+            s["res"] = None
+        elif s["sup"] is not None and c < s["sup"]:
+            s["state"] = "bearish"
+            s["sup"] = None
+
+        s["prev_green"] = green
+        s["prev_red"] = red
+        s["last_high"] = h
+        s["last_low"] = l
+
+        return old_state != s["state"]
+
+    s["prev_green"] = green
+    s["prev_red"] = red
+    s["last_high"] = h
+    s["last_low"] = l
+    return False
+
+
+async def get_htf_states(symbol: str) -> Dict[str, str]:
+    """Fetch recent candles for each HTF and update structure state."""
+    results = {}
+    async with aiohttp.ClientSession() as session:
+        for tf in HTF_LIST:
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={tf}&limit=12"
+            try:
+                async with session.get(url, timeout=8) as resp:
+                    data = await resp.json()
+                    if not isinstance(data, list) or not data:
+                        results[tf] = "neutral"
+                        continue
+
+                    # Process all closed candles to advance structure
+                    for candle in data[:-1]:
+                        o = float(candle[1])
+                        h = float(candle[2])
+                        l = float(candle[3])
+                        c = float(candle[4])
+                        update_structure(symbol, tf, o, h, l, c, is_closed=True)
+
+                    results[tf] = structure[symbol][tf]["state"]
+            except Exception as e:
+                print(f"[HTF] {symbol} {tf} error: {e}")
+                results[tf] = "neutral"
+    return results
+
+
+# ==========================================================================
+# Z-SCORE
 # ==========================================================================
 def calc_zscore(vols: Deque[float]) -> Optional[float]:
     if len(vols) < 2:
@@ -93,8 +179,7 @@ def calc_zscore(vols: Deque[float]) -> Optional[float]:
         return None
 
 
-def get_level(z: float) -> Optional[tuple]:
-    """Return (threshold, color, label) or None if below green."""
+def get_level(z: float) -> Optional[Tuple[float, str, str]]:
     for thresh, color, label in LEVELS:
         if z >= thresh:
             return thresh, color, label
@@ -105,7 +190,6 @@ def get_level(z: float) -> Optional[tuple]:
 # HISTORICAL LOAD
 # ==========================================================================
 async def load_historical(session: aiohttp.ClientSession, symbol: str) -> bool:
-    """Fetch last Z_LENGTH closed candles and fill the deque."""
     url = (
         f"https://fapi.binance.com/fapi/v1/klines"
         f"?symbol={symbol}&interval={TIMEFRAME}&limit={Z_LENGTH + 1}"
@@ -114,16 +198,12 @@ async def load_historical(session: aiohttp.ClientSession, symbol: str) -> bool:
         async with session.get(url, timeout=12) as resp:
             data = await resp.json()
             if not isinstance(data, list) or len(data) < 10:
-                print(f"[HIST] {symbol} bad data")
                 return False
 
-            # drop the currently forming candle
             closed = data[:-1]
-            vols = [float(c[5]) for c in closed]   # index 5 = volume
-
+            vols = [float(c[5]) for c in closed]
             volumes[symbol].clear()
-            volumes[symbol].extend(vols[-Z_LENGTH:])  # keep at most Z_LENGTH
-
+            volumes[symbol].extend(vols[-Z_LENGTH:])
             print(f"[HIST] {symbol} loaded {len(volumes[symbol])} bars")
             return True
     except Exception as e:
@@ -132,7 +212,7 @@ async def load_historical(session: aiohttp.ClientSession, symbol: str) -> bool:
 
 
 # ==========================================================================
-# COIN SELECTION (same filters as before)
+# COIN SELECTION
 # ==========================================================================
 async def has_volatile_15m(session: aiohttp.ClientSession, symbol: str) -> bool:
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit={VOLATILITY_LOOKBACK + 1}"
@@ -158,7 +238,6 @@ async def select_symbols() -> List[str]:
             tickers = await resp.json()
 
         if not isinstance(tickers, list):
-            print("[SELECT] Unexpected response")
             return []
 
         candidates = []
@@ -184,7 +263,7 @@ async def select_symbols() -> List[str]:
                 selected.append(sym)
                 print(f"[SELECT] ✅ {sym}  {vol/1e6:.1f}M")
             else:
-                print(f"[SELECT] ❌ {sym}  no 1% 15m move")
+                print(f"[SELECT] ❌ {sym}")
 
         return selected
 
@@ -209,47 +288,79 @@ async def kline_listener(symbol: str):
                     try:
                         msg = json.loads(raw)
                         k = msg["k"]
-                        if not k["x"]:                     # only on candle close
+                        if not k["x"]:
                             continue
 
+                        o = float(k["o"])
+                        h = float(k["h"])
+                        l = float(k["l"])
+                        c = float(k["c"])
                         vol = float(k["v"])
-                        volumes[symbol].append(vol)
 
+                        volumes[symbol].append(vol)
                         z = calc_zscore(volumes[symbol])
                         if z is None:
                             continue
 
-                        level = get_level(z)
-
-                        # ----- Cooldown reset on gray / navy -----
-                        if z < 1.5:                        # gray or navy
-                            for color in cooldown[symbol]:
+                        # ----- Reset cooldowns on Gray / Navy -----
+                        if z < ALERT_Z_MIN:
+                            for color in list(cooldown[symbol].keys()):
                                 if cooldown[symbol][color]:
-                                    print(f"[RESET] {symbol} {color} cooldown cleared (Z={z:.2f})")
+                                    print(f"[RESET] {symbol} {color} cleared (Z={z:.2f})")
                                 cooldown[symbol][color] = False
-                            continue                       # never alert on gray/navy
+                            continue
 
-                        # ----- Alert only green and above -----
+                        level = get_level(z)
                         if level is None:
                             continue
 
                         _, color, label = level
 
+                        # Already on cooldown for this color?
                         if cooldown[symbol][color]:
-                            # still on cooldown for this color
                             continue
 
-                        # Fire alert + set cooldown for this color
+                        # ========== HTF STRUCTURE FILTER ==========
+                        is_green = c > o
+                        is_red = c < o
+
+                        htf_states = await get_htf_states(symbol)
+
+                        any_bearish = any(st == "bearish" for st in htf_states.values())
+                        any_bullish = any(st == "bullish" for st in htf_states.values())
+
+                        allowed = False
+                        if is_green and any_bearish:
+                            allowed = True
+                        elif is_red and any_bullish:
+                            allowed = True
+
+                        if not allowed:
+                            # Still set cooldown so we don't keep re-checking this spike
+                            cooldown[symbol][color] = True
+                            print(f"[FILTER] {symbol} {label} Z={z:.2f} blocked by HTF "
+                                  f"(candle={'GREEN' if is_green else 'RED'}, HTF={htf_states})")
+                            continue
+
+                        # ===== ALERT =====
                         cooldown[symbol][color] = True
 
-                        msg = (
+                        htf_lines = "\n".join(
+                            f"{tf.upper():<4}: {htf_states.get(tf, 'neutral').capitalize()}"
+                            for tf in HTF_LIST
+                        )
+
+                        alert_msg = (
                             f"<b>{symbol}</b>  {label}\n"
                             f"Z-Score: <b>{z:.2f}</b>\n"
+                            f"Candle: {'GREEN 🟢' if is_green else 'RED 🔴'}\n"
                             f"Volume: {vol:,.0f}\n"
-                            f"TF: {TIMEFRAME}"
+                            f"TF: {TIMEFRAME}\n"
+                            f"────────────────\n"
+                            f"{htf_lines}"
                         )
                         print(f"[ALERT] {symbol} {label} Z={z:.2f}")
-                        await send_telegram(msg)
+                        await send_telegram(alert_msg)
 
                     except Exception as e:
                         print(f"[WS] Parse error {symbol}: {e}")
@@ -273,7 +384,6 @@ async def refresh_symbols():
     new_list = await select_symbols()
     new_set = set(new_list)
 
-    # stop removed
     for sym in list(active_symbols - new_set):
         active_symbols.discard(sym)
         task = listener_tasks.pop(sym, None)
@@ -281,14 +391,14 @@ async def refresh_symbols():
             task.cancel()
         volumes.pop(sym, None)
         cooldown.pop(sym, None)
+        structure.pop(sym, None)
         print(f"[MGR] Removed {sym}")
 
-    # start new ones (load history first)
     async with aiohttp.ClientSession() as session:
         for sym in new_set - active_symbols:
             ok = await load_historical(session, sym)
             if not ok:
-                print(f"[MGR] Skipping {sym} – history load failed")
+                print(f"[MGR] Skipping {sym} – history failed")
                 continue
             active_symbols.add(sym)
             listener_tasks[sym] = asyncio.create_task(kline_listener(sym))
@@ -317,11 +427,12 @@ async def symbol_refresher():
 # MAIN
 # ==========================================================================
 async def main():
-    print("Volume Z-Score Bot starting...")
+    print("Volume Z-Score + HTF Structure Bot starting...")
     await send_telegram(
-        f"Volume Z-Score Bot started ✅\n"
+        f"Volume Z-Score + HTF Filter started ✅\n"
         f"TF: {TIMEFRAME} | Lookback: {Z_LENGTH}\n"
-        f"Alerting on Green+ (Z ≥ {ALERT_Z_MIN})"
+        f"Green candle → needs any HTF Bearish\n"
+        f"Red candle → needs any HTF Bullish"
     )
     await refresh_symbols()
     await symbol_refresher()
