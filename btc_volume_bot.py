@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Arrival rate DELTA panel: buy_rate - sell_rate per candle, bars only.
-Green bar above zero = buys arriving faster than sells.
-Red bar below zero = sells arriving faster than buys.
-No lines, no z-score.
+Z_LOOKBACK / Z_THRESHOLD control when a bar is highlighted as an outlier.
+No line is plotted — the z-score only decides bar color.
 """
 
 import asyncio
@@ -20,7 +19,9 @@ from matplotlib.patches import Rectangle
 # CONFIG
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
-VISIBLE_CANDLES = 600
+VISIBLE_CANDLES = 200
+Z_LOOKBACK = 30
+Z_THRESHOLD = 2.0
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
@@ -116,13 +117,28 @@ def compute_candle_arrival_rate(times_ms, bar_open_ms, bar_close_ms):
     return rates
 
 
+def rolling_zscore(series, lookback=Z_LOOKBACK):
+    n = len(series)
+    z = np.zeros(n)
+    for i in range(n):
+        window = series[max(0, i - lookback + 1): i + 1]
+        if len(window) < 5:
+            continue
+        mean = np.mean(window)
+        std = np.std(window)
+        if std > 1e-12:
+            z[i] = (series[i] - mean) / std
+    return z
+
+
 # --------------------------------------------------------------------------
 # Chart
 # --------------------------------------------------------------------------
-def create_chart(kline_df, delta):
+def create_chart(kline_df, delta, z_scores):
     display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
     n = len(display_df)
     d = delta[-n:]
+    z = z_scores[-n:]
 
     fig = plt.figure(figsize=(18, 10), facecolor="black")
     gs = fig.add_gridspec(2, 1, height_ratios=[2.8, 1.4], hspace=0.07)
@@ -146,17 +162,32 @@ def create_chart(kline_df, delta):
                           facecolor=color, edgecolor=color)
         ax_candle.add_patch(rect)
 
+    # star flag on candles where |z| >= threshold
+    span = display_df["high"].max() - display_df["low"].min()
+    for idx in range(n):
+        if abs(z[idx]) >= Z_THRESHOLD:
+            y = display_df["high"].iloc[idx] + span * 0.02
+            ax_candle.plot(idx, y, marker="*", color="#ffdd00", markersize=12, zorder=5)
+
     ax_candle.set_xlim(-1, n)
     ax_candle.set_title(
-        f"{SYMBOL} 1m  |  Arrival Rate Delta (buy - sell)",
+        f"{SYMBOL} 1m  |  Arrival Rate Delta (buy - sell)  |  "
+        f"z lookback={Z_LOOKBACK}  threshold={Z_THRESHOLD}σ",
         color="white", fontsize=12, pad=8
     )
     ax_candle.grid(True, color="#333333", alpha=0.4)
     plt.setp(ax_candle.get_xticklabels(), visible=False)
 
-    # Delta panel: bars only, green above zero (buy faster), red below (sell faster)
-    bar_colors = ["#00ff88" if v >= 0 else "#ff4466" for v in d]
-    ax_delta.bar(range(n), d, color=bar_colors, width=0.65, alpha=0.9, zorder=2)
+    # Delta panel: bars only, no line. Bright color if |z| >= threshold, dim otherwise.
+    bar_colors = []
+    for i in range(n):
+        outlier = abs(z[i]) >= Z_THRESHOLD
+        if d[i] >= 0:
+            bar_colors.append("#00ff88" if outlier else "#2e6b4a")
+        else:
+            bar_colors.append("#ff4466" if outlier else "#7a2e3a")
+
+    ax_delta.bar(range(n), d, color=bar_colors, width=0.65, alpha=0.95, zorder=2)
     ax_delta.axhline(0, color="white", linewidth=0.8, alpha=0.6)
     ax_delta.set_ylabel("Δ rate (trades/sec)", color="white", fontsize=9)
     ax_delta.grid(True, color="#333333", alpha=0.4)
@@ -209,8 +240,8 @@ async def main():
             print("2. Fetching full trade tape (buy/sell tagged)...")
             trade_times, is_buyer_maker = await fetch_all_agg_trades(session, SYMBOL, start_ms, end_ms)
 
-        buy_times = trade_times[~is_buyer_maker]   # taker bought = BUY aggression
-        sell_times = trade_times[is_buyer_maker]   # taker sold = SELL aggression
+        buy_times = trade_times[~is_buyer_maker]
+        sell_times = trade_times[is_buyer_maker]
         print(f"   Buys: {len(buy_times):,}  Sells: {len(sell_times):,}")
 
         bar_open_ms = np.array(
@@ -223,15 +254,21 @@ async def main():
         sell_rate = compute_candle_arrival_rate(sell_times, bar_open_ms, bar_close_ms)
         delta = buy_rate - sell_rate
 
-        print("4. Creating chart...")
-        photo = create_chart(kline_df, delta)
+        print("4. Computing rolling z-score of delta...")
+        z_scores = rolling_zscore(delta, lookback=Z_LOOKBACK)
+        n_flagged = int(np.sum(np.abs(z_scores) >= Z_THRESHOLD))
+        print(f"   {n_flagged} candles with |z| >= {Z_THRESHOLD}")
+
+        print("5. Creating chart...")
+        photo = create_chart(kline_df, delta, z_scores)
         print(f"   Chart size: {len(photo)/1024:.1f} KB")
 
-        caption = f"{SYMBOL} – Arrival Rate Delta (buy - sell), bars only"
+        caption = (f"{SYMBOL} – Arrival Rate Delta\n"
+                   f"z lookback={Z_LOOKBACK} | threshold={Z_THRESHOLD}σ | {n_flagged} flagged")
 
-        print("5. Sending...")
+        print("6. Sending...")
         await send_photo(photo, caption)
-        print("6. Done.")
+        print("7. Done.")
 
     except Exception as e:
         print("ERROR:", str(e))
