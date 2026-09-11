@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Arrival rate DELTA panel: buy_rate - sell_rate per candle, bars only.
+Arrival rate VOLUME-style panel: buy_rate and sell_rate shown as separate bars
+(green up = buy, red down = sell) — not netted into delta.
 Z_LOOKBACK / Z_THRESHOLD control when a bar is highlighted as an outlier.
-No line is plotted — the z-score only decides bar color.
+No lines plotted.
 """
 
 import asyncio
@@ -20,7 +21,7 @@ from matplotlib.patches import Rectangle
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
 VISIBLE_CANDLES = 200
-Z_LOOKBACK = 20
+Z_LOOKBACK = 30
 Z_THRESHOLD = 2.0
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
@@ -134,18 +135,20 @@ def rolling_zscore(series, lookback=Z_LOOKBACK):
 # --------------------------------------------------------------------------
 # Chart
 # --------------------------------------------------------------------------
-def create_chart(kline_df, delta, z_scores):
+def create_chart(kline_df, buy_rate, sell_rate, buy_z, sell_z):
     display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
     n = len(display_df)
-    d = delta[-n:]
-    z = z_scores[-n:]
+    b = buy_rate[-n:]
+    s = sell_rate[-n:]
+    bz = buy_z[-n:]
+    sz = sell_z[-n:]
 
     fig = plt.figure(figsize=(18, 10), facecolor="black")
     gs = fig.add_gridspec(2, 1, height_ratios=[2.8, 1.4], hspace=0.07)
     ax_candle = fig.add_subplot(gs[0])
-    ax_delta = fig.add_subplot(gs[1], sharex=ax_candle)
+    ax_rate = fig.add_subplot(gs[1], sharex=ax_candle)
 
-    for ax in [ax_candle, ax_delta]:
+    for ax in [ax_candle, ax_rate]:
         ax.set_facecolor("black")
         ax.tick_params(colors="white")
         for spine in ax.spines.values():
@@ -162,40 +165,36 @@ def create_chart(kline_df, delta, z_scores):
                           facecolor=color, edgecolor=color)
         ax_candle.add_patch(rect)
 
-    # star flag on candles where |z| >= threshold
+    # star flag if either side is an outlier
     span = display_df["high"].max() - display_df["low"].min()
     for idx in range(n):
-        if abs(z[idx]) >= Z_THRESHOLD:
+        if abs(bz[idx]) >= Z_THRESHOLD or abs(sz[idx]) >= Z_THRESHOLD:
             y = display_df["high"].iloc[idx] + span * 0.02
             ax_candle.plot(idx, y, marker="*", color="#ffdd00", markersize=12, zorder=5)
 
     ax_candle.set_xlim(-1, n)
     ax_candle.set_title(
-        f"{SYMBOL} 1m  |  Arrival Rate Delta (buy - sell)  |  "
+        f"{SYMBOL} 1m  |  Arrival Rate Volume Panel (buy up / sell down)  |  "
         f"z lookback={Z_LOOKBACK}  threshold={Z_THRESHOLD}σ",
         color="white", fontsize=12, pad=8
     )
     ax_candle.grid(True, color="#333333", alpha=0.4)
     plt.setp(ax_candle.get_xticklabels(), visible=False)
 
-    # Delta panel: bars only, no line. Bright color if |z| >= threshold, dim otherwise.
-    bar_colors = []
-    for i in range(n):
-        outlier = abs(z[i]) >= Z_THRESHOLD
-        if d[i] >= 0:
-            bar_colors.append("#00ff88" if outlier else "#2e6b4a")
-        else:
-            bar_colors.append("#ff4466" if outlier else "#7a2e3a")
+    # Volume-style panel: green up = buy rate, red down = sell rate, bars only
+    buy_colors = ["#00ff88" if abs(bz[i]) >= Z_THRESHOLD else "#2e6b4a" for i in range(n)]
+    sell_colors = ["#ff4466" if abs(sz[i]) >= Z_THRESHOLD else "#7a2e3a" for i in range(n)]
 
-    ax_delta.bar(range(n), d, color=bar_colors, width=0.65, alpha=0.95, zorder=2)
-    ax_delta.axhline(0, color="white", linewidth=0.8, alpha=0.6)
-    ax_delta.set_ylabel("Δ rate (trades/sec)", color="white", fontsize=9)
-    ax_delta.grid(True, color="#333333", alpha=0.4)
+    ax_rate.bar(range(n), b, color=buy_colors, width=0.65, alpha=0.95, zorder=2)
+    ax_rate.bar(range(n), -s, color=sell_colors, width=0.65, alpha=0.95, zorder=2)
+    ax_rate.axhline(0, color="white", linewidth=0.8, alpha=0.6)
+    ax_rate.set_ylabel("Arrival rate (trades/sec)", color="white", fontsize=9)
+    ax_rate.grid(True, color="#333333", alpha=0.4)
 
     step = max(1, n // 12)
-    ax_delta.set_xticks(range(0, n, step))
+    ax_rate.set_xticks(range(0, n, step))
     labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, n, step)]
-    ax_delta.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
+    ax_rate.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
 
     plt.tight_layout()
     buf = io.BytesIO()
@@ -213,7 +212,7 @@ async def send_photo(photo_bytes, caption=""):
     data = aiohttp.FormData()
     data.add_field("chat_id", str(CHAT_ID))
     data.add_field("caption", caption)
-    data.add_field("photo", photo_bytes, filename="arrival_rate_delta.png", content_type="image/png")
+    data.add_field("photo", photo_bytes, filename="arrival_rate_volume.png", content_type="image/png")
     async with aiohttp.ClientSession() as session:
         async with session.post(url, data=data, timeout=60) as resp:
             text = await resp.text()
@@ -252,18 +251,18 @@ async def main():
         print("3. Computing per-candle arrival rates...")
         buy_rate = compute_candle_arrival_rate(buy_times, bar_open_ms, bar_close_ms)
         sell_rate = compute_candle_arrival_rate(sell_times, bar_open_ms, bar_close_ms)
-        delta = buy_rate - sell_rate
 
-        print("4. Computing rolling z-score of delta...")
-        z_scores = rolling_zscore(delta, lookback=Z_LOOKBACK)
-        n_flagged = int(np.sum(np.abs(z_scores) >= Z_THRESHOLD))
-        print(f"   {n_flagged} candles with |z| >= {Z_THRESHOLD}")
+        print("4. Computing rolling z-score per side...")
+        buy_z = rolling_zscore(buy_rate, lookback=Z_LOOKBACK)
+        sell_z = rolling_zscore(sell_rate, lookback=Z_LOOKBACK)
+        n_flagged = int(np.sum((np.abs(buy_z) >= Z_THRESHOLD) | (np.abs(sell_z) >= Z_THRESHOLD)))
+        print(f"   {n_flagged} candles with either side |z| >= {Z_THRESHOLD}")
 
         print("5. Creating chart...")
-        photo = create_chart(kline_df, delta, z_scores)
+        photo = create_chart(kline_df, buy_rate, sell_rate, buy_z, sell_z)
         print(f"   Chart size: {len(photo)/1024:.1f} KB")
 
-        caption = (f"{SYMBOL} – Arrival Rate Delta\n"
+        caption = (f"{SYMBOL} – Arrival Rate Volume Panel\n"
                    f"z lookback={Z_LOOKBACK} | threshold={Z_THRESHOLD}σ | {n_flagged} flagged")
 
         print("6. Sending...")
