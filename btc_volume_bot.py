@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Pure continuous Hawkes process on raw trade tape.
-- No candle-awareness in the Hawkes calc at all
-- Intensity updates at every single trade (canonical recursive exponential kernel)
-- Z-score computed at trade-level over a rolling TIME window
-- Events (z >= threshold) are then mapped onto whichever 1m candle contains them
-- Candles get flagged/marked, not colored bar-by-bar
+Hawkes Process anomaly detection - ported from tripolskypetr/volume-anomaly (Hawkes-only)
+- Fit μ, α, β via MLE (Nelder-Mead) on a historical trade chunk
+- Slide a `recent` window across the rest of the tape
+- Score each window: sigmoid(peakLambda/meanLambda, centered at ratio=2)
+- Map flagged windows onto candles, mark on chart
 """
 
 import asyncio
@@ -17,20 +16,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.patches import Rectangle
+from scipy.optimize import minimize
 
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
 SYMBOL = "BTCUSDT"
-
 VISIBLE_CANDLES = 200
-Z_LOOKBACK_SEC = 60         # rolling time window (sec) for trade-level z-score
-STD_MULT = 2.5              # threshold to flag an event
 
-# Hawkes parameters -- n = ALPHA/BETA MUST be < 1 for stability
-MU = 0.05
-ALPHA = 0.4
-BETA = 0.6                  # n = 0.4/0.6 = 0.67
+TRAIN_TRADES = 1200         # historical trades used to fit mu/alpha/beta (calm baseline)
+RECENT_WINDOW = 150         # trades per sliding evaluation window
+STEP = 50                   # trades to advance the window each step
+SCORE_THRESHOLD = 0.5       # sigmoid score >= this -> flagged (0.5 = 2x baseline intensity)
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
@@ -38,29 +35,24 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
 # --------------------------------------------------------------------------
-# Fetch Klines
+# Fetch Klines / Trades (same as before)
 # --------------------------------------------------------------------------
 async def fetch_klines(session, symbol, total_needed):
     all_data = []
     remaining = total_needed
     end_time = None
-
     while remaining > 0:
         limit = min(1500, remaining)
         url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}"
         if end_time:
             url += f"&endTime={end_time}"
-
         async with session.get(url, timeout=15) as resp:
             data = await resp.json()
-
         if not data:
             break
-
         all_data = data + all_data
         remaining -= len(data)
         end_time = data[0][0] - 1
-
         if len(data) < limit:
             break
         await asyncio.sleep(0.2)
@@ -76,108 +68,186 @@ async def fetch_klines(session, symbol, total_needed):
     return df.drop_duplicates(subset=["open_time"]).reset_index(drop=True)
 
 
-# --------------------------------------------------------------------------
-# Fetch ALL trade times
-# --------------------------------------------------------------------------
 async def fetch_all_trade_times(session, symbol, start_ms, end_ms):
     times = []
     current_start = start_ms
-
     print("   Fetching aggTrades...")
     while current_start < end_ms:
         url = (f"https://fapi.binance.com/fapi/v1/aggTrades"
                f"?symbol={symbol}&startTime={current_start}&endTime={end_ms}&limit=1000")
-
         async with session.get(url, timeout=20) as resp:
             trades = await resp.json()
-
         if not trades or not isinstance(trades, list):
             break
-
         for t in trades:
             times.append(t["T"])
-
         if len(trades) < 1000:
             break
-
         current_start = trades[-1]["T"] + 1
         await asyncio.sleep(0.12)
-
     times.sort()
     print(f"   Collected {len(times):,} trades")
     return np.array(times, dtype=np.int64)
 
 
 # --------------------------------------------------------------------------
-# PURE continuous Hawkes at trade level -> event list
+# Hawkes math (ported from volume-anomaly's src/math)
 # --------------------------------------------------------------------------
-def compute_trade_level_hawkes_events(trade_times_ms, mu=MU, alpha=ALPHA, beta=BETA,
-                                        z_lookback_sec=Z_LOOKBACK_SEC, std_mult=STD_MULT):
-    n = len(trade_times_ms)
+def hawkes_log_likelihood(timestamps_s, mu, alpha, beta):
+    """Ogata O(n) recursive log-likelihood. timestamps_s sorted ascending, seconds."""
+    if mu <= 0 or alpha <= 0 or beta <= 0:
+        return -np.inf
+    n = len(timestamps_s)
     if n == 0:
-        return [], np.array([])
+        return -np.inf
 
-    intensities = np.zeros(n)
-    lam = mu
-    t_cur = None
+    T = timestamps_s[-1] - timestamps_s[0]
+    A = 0.0
+    ll_data = 0.0
+    compensator = 0.0
+    t_prev = timestamps_s[0]
 
-    # pass 1: continuous recursive intensity, one update per trade, no resets
     for i in range(n):
-        ts = trade_times_ms[i] / 1000.0
-        if t_cur is not None:
-            dt = ts - t_cur
-            if dt > 0:
-                lam = mu + (lam - mu) * np.exp(-beta * dt)
-        lam += alpha
-        t_cur = ts
-        intensities[i] = lam
+        ti = timestamps_s[i]
+        if i > 0:
+            A = np.exp(-beta * (ti - t_prev)) * (1 + A)
+        lam = mu + alpha * A
+        if lam <= 0:
+            return -np.inf
+        ll_data += np.log(lam)
+        compensator += (1 - np.exp(-beta * (T - (ti - timestamps_s[0]))))
+        t_prev = ti
 
-    # pass 2: rolling TIME-window z-score per trade
-    events = []
-    times_s = trade_times_ms.astype(np.float64) / 1000.0
-    left = 0
+    ll = -mu * T - (alpha / beta) * compensator + ll_data
+    return ll
+
+
+def hawkes_fit(timestamps_ms):
+    """Fit mu, alpha, beta via Nelder-Mead MLE. timestamps_ms sorted ascending."""
+    n = len(timestamps_ms)
+    if n < 10:
+        # flat Poisson fallback
+        return {"mu": 0.1, "alpha": 0.0, "beta": 1.0, "converged": False}
+
+    t_s = (timestamps_ms - timestamps_ms[0]).astype(np.float64) / 1000.0
+    T = t_s[-1]
+    if T <= 0:
+        return {"mu": 0.1, "alpha": 0.0, "beta": 1.0, "converged": False}
+
+    mu0 = 0.5 * n / T
+    alpha0 = 0.4 * n / T
+    beta0 = n / T
+
+    def neg_ll(params):
+        mu, alpha, beta = params
+        if mu <= 0 or alpha <= 0 or beta <= 0 or alpha >= beta:
+            return 1e10
+        ll = hawkes_log_likelihood(t_s, mu, alpha, beta)
+        if not np.isfinite(ll):
+            return 1e10
+        return -ll
+
+    result = minimize(neg_ll, x0=[mu0, alpha0, beta0], method="Nelder-Mead",
+                       options={"maxiter": 1000, "xatol": 1e-8, "fatol": 1e-8})
+
+    mu, alpha, beta = result.x
+    converged = result.success and alpha < beta and mu > 0 and alpha > 0 and beta > 0
+
+    return {"mu": max(mu, 1e-6), "alpha": max(alpha, 0.0), "beta": max(beta, 1e-6),
+            "converged": converged, "branching": alpha / beta if beta > 0 else np.inf}
+
+
+def hawkes_peak_lambda(timestamps_s, mu, alpha, beta):
+    """Max lambda(t_i) over the window, O(n) recursive."""
+    n = len(timestamps_s)
+    if n == 0:
+        return mu
+    A = 0.0
+    peak = mu
+    t_prev = timestamps_s[0]
     for i in range(n):
-        t_now = times_s[i]
-        while times_s[left] < t_now - z_lookback_sec:
-            left += 1
-        window = intensities[left:i + 1]
-        if len(window) < 10:
-            continue
-        mean = np.mean(window)
-        std = np.std(window)
-        if std < 1e-12:
-            continue
-        z = (intensities[i] - mean) / std
-        if z >= std_mult:
-            events.append((trade_times_ms[i], z))
+        ti = timestamps_s[i]
+        if i > 0:
+            A = np.exp(-beta * (ti - t_prev)) * (1 + A)
+        lam = mu + alpha * A
+        peak = max(peak, lam)
+        t_prev = ti
+    return peak
 
-    return events, intensities
+
+def sigmoid_ratio(ratio, center=2.0, steepness=2.0):
+    return 1.0 / (1.0 + np.exp(-(ratio - center) * steepness))
+
+
+def hawkes_anomaly_score(window_times_ms, mu, alpha, beta, window_duration_s=None):
+    """Matches volume-anomaly's score_hawkes: max(intensityScore, rateScore)."""
+    branching = alpha / beta if beta > 0 else np.inf
+    if branching >= 1:
+        return 1.0  # supercritical -> unconditional flag
+
+    t_s = window_times_ms.astype(np.float64) / 1000.0
+    mean_lambda = mu / (1 - branching)
+    peak_lambda = hawkes_peak_lambda(t_s, mu, alpha, beta)
+    intensity_score = sigmoid_ratio(peak_lambda / mean_lambda)
+
+    rate_score = 0.0
+    if window_duration_s and window_duration_s > 0 and mu > 0:
+        n = len(window_times_ms)
+        empirical_rate = n / window_duration_s
+        rate_score = sigmoid_ratio(empirical_rate / mu)
+
+    return max(intensity_score, rate_score)
 
 
 # --------------------------------------------------------------------------
-# Map trade-level events onto candles
+# Sliding window scan -> flagged candles
 # --------------------------------------------------------------------------
-def flag_candles_from_events(events, kline_df):
-    open_ms = (kline_df["open_time"].astype(np.int64) // 1_000_000).values  # ns -> ms
-    flagged = {}
-    for t_ms, z in events:
-        idx = np.searchsorted(open_ms, t_ms, side="right") - 1
-        if idx < 0 or idx >= len(kline_df):
-            continue
-        if idx not in flagged or z > flagged[idx]:
-            flagged[idx] = z
-    return flagged  # {candle_index: peak_z}
+def scan_and_flag(trade_times_ms, kline_df, train_n=TRAIN_TRADES,
+                   recent_n=RECENT_WINDOW, step=STEP, threshold=SCORE_THRESHOLD):
+
+    if len(trade_times_ms) < train_n + recent_n:
+        train_n = max(10, len(trade_times_ms) // 3)
+        print(f"   Not enough trades for configured TRAIN_TRADES, using {train_n}")
+
+    historical = trade_times_ms[:train_n]
+    print(f"   Fitting Hawkes on {len(historical)} historical trades...")
+    fit = hawkes_fit(historical)
+    print(f"   mu={fit['mu']:.4f} alpha={fit['alpha']:.4f} beta={fit['beta']:.4f} "
+          f"branching={fit.get('branching', 0):.3f} converged={fit['converged']}")
+
+    mu, alpha, beta = fit["mu"], fit["alpha"], fit["beta"]
+
+    open_ms = (kline_df["open_time"].astype(np.int64) // 1_000_000).values
+    flagged = {}  # {candle_index: peak_score}
+
+    i = train_n
+    n_trades = len(trade_times_ms)
+    while i + recent_n <= n_trades:
+        window = trade_times_ms[i:i + recent_n]
+        duration_s = (window[-1] - window[0]) / 1000.0
+        score = hawkes_anomaly_score(window, mu, alpha, beta, window_duration_s=duration_s)
+
+        if score >= threshold:
+            # map window's time span onto every candle it overlaps
+            w_start, w_end = window[0], window[-1]
+            start_idx = np.searchsorted(open_ms, w_start, side="right") - 1
+            end_idx = np.searchsorted(open_ms, w_end, side="right") - 1
+            for idx in range(max(start_idx, 0), min(end_idx, len(kline_df) - 1) + 1):
+                if idx not in flagged or score > flagged[idx]:
+                    flagged[idx] = score
+
+        i += step
+
+    return flagged, fit
 
 
 # --------------------------------------------------------------------------
-# Create Chart
+# Chart
 # --------------------------------------------------------------------------
-def create_chart(kline_df, flagged_full):
+def create_chart(kline_df, flagged_full, fit):
     display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
     offset = len(kline_df) - len(display_df)
-
-    # remap flagged indices into display_df's local indexing
-    flagged = {idx - offset: z for idx, z in flagged_full.items()
+    flagged = {idx - offset: s for idx, s in flagged_full.items()
                if 0 <= idx - offset < len(display_df)}
 
     volumes = display_df["volume"].astype(float).values
@@ -198,19 +268,21 @@ def create_chart(kline_df, flagged_full):
                           facecolor=color, edgecolor=color)
         ax_candle.add_patch(rect)
 
-    # mark flagged candles with a star above the high + z-score label
-    for idx, z in flagged.items():
+    for idx, score in flagged.items():
         high = display_df["high"].iloc[idx]
         span = display_df["high"].max() - display_df["low"].min()
         y = high + span * 0.02
         ax_candle.plot(idx, y, marker="*", color="#ffdd00", markersize=14, zorder=5)
-        ax_candle.text(idx, y + span * 0.015, f"z={z:.1f}", color="#ffdd00",
+        ax_candle.text(idx, y + span * 0.015, f"{score:.2f}", color="#ffdd00",
                         fontsize=7, ha="center", zorder=5)
 
     ax_candle.set_xlim(-1, len(display_df))
+    branching = fit.get("branching", alpha_beta_ratio(fit))
     ax_candle.set_title(
-        f"{SYMBOL} 1m  |  Pure Continuous Hawkes  |  μ={MU} α={ALPHA} β={BETA} (n={ALPHA/BETA:.2f})\n"
-        f"Flagged candles: {len(flagged)}  |  z_lookback={Z_LOOKBACK_SEC}s  |  threshold={STD_MULT}σ",
+        f"{SYMBOL} 1m  |  Hawkes MLE-fit  |  μ={fit['mu']:.3f} α={fit['alpha']:.3f} "
+        f"β={fit['beta']:.3f} (n={branching:.2f})\n"
+        f"Flagged candles: {len(flagged)}  |  window={RECENT_WINDOW} trades, step={STEP}  |  "
+        f"threshold={SCORE_THRESHOLD}",
         color="white", fontsize=12, pad=10
     )
     ax_candle.grid(True, color="#333333", alpha=0.4)
@@ -222,9 +294,9 @@ def create_chart(kline_df, flagged_full):
     ax_vol.spines["right"].set_color("#4488ff")
     ax_vol.set_ylim(0, volumes.max() * 4 if len(volumes) and volumes.max() > 0 else 1)
 
-    step = max(1, len(display_df) // 12)
-    ax_candle.set_xticks(range(0, len(display_df), step))
-    labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, len(display_df), step)]
+    step_n = max(1, len(display_df) // 12)
+    ax_candle.set_xticks(range(0, len(display_df), step_n))
+    labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, len(display_df), step_n)]
     ax_candle.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
 
     plt.tight_layout()
@@ -235,6 +307,10 @@ def create_chart(kline_df, flagged_full):
     return buf.getvalue()
 
 
+def alpha_beta_ratio(fit):
+    return fit["alpha"] / fit["beta"] if fit["beta"] > 0 else float("inf")
+
+
 # --------------------------------------------------------------------------
 # Send Photo
 # --------------------------------------------------------------------------
@@ -243,8 +319,7 @@ async def send_photo(photo_bytes, caption=""):
     data = aiohttp.FormData()
     data.add_field("chat_id", str(CHAT_ID))
     data.add_field("caption", caption)
-    data.add_field("photo", photo_bytes, filename="hawkes_pure.png", content_type="image/png")
-
+    data.add_field("photo", photo_bytes, filename="hawkes_mle.png", content_type="image/png")
     async with aiohttp.ClientSession() as session:
         async with session.post(url, data=data, timeout=60) as resp:
             text = await resp.text()
@@ -262,7 +337,7 @@ async def main():
     try:
         print("1. Fetching klines...")
         async with aiohttp.ClientSession() as session:
-            kline_df = await fetch_klines(session, SYMBOL, VISIBLE_CANDLES + 40)
+            kline_df = await fetch_klines(session, SYMBOL, VISIBLE_CANDLES + 60)
             print(f"   Got {len(kline_df)} klines")
 
             start_ms = int(kline_df["open_time"].iloc[0].timestamp() * 1000)
@@ -271,26 +346,22 @@ async def main():
             print("2. Fetching full trade tape...")
             trade_times = await fetch_all_trade_times(session, SYMBOL, start_ms, end_ms)
 
-        print("3. Running pure continuous Hawkes over trade tape...")
-        events, intensities = compute_trade_level_hawkes_events(trade_times)
-        print(f"   {len(events)} trade-level events crossed {STD_MULT}σ "
-              f"(n={ALPHA/BETA:.2f}, {'stable' if ALPHA/BETA < 1 else 'UNSTABLE - lower alpha or raise beta'})")
-
-        print("4. Mapping events onto candles...")
-        flagged = flag_candles_from_events(events, kline_df)
+        print("3. Fitting Hawkes + scanning sliding windows...")
+        flagged, fit = scan_and_flag(trade_times, kline_df)
         print(f"   {len(flagged)} candles flagged")
 
-        print("5. Creating chart...")
-        photo = create_chart(kline_df, flagged)
+        print("4. Creating chart...")
+        photo = create_chart(kline_df, flagged, fit)
         print(f"   Chart size: {len(photo)/1024:.1f} KB")
 
-        caption = (f"{SYMBOL} – Pure Continuous Hawkes\n"
-                   f"μ={MU} α={ALPHA} β={BETA} (n={ALPHA/BETA:.2f})\n"
-                   f"{len(flagged)} candles flagged | threshold {STD_MULT}σ")
+        caption = (f"{SYMBOL} – Hawkes MLE anomaly scan\n"
+                   f"μ={fit['mu']:.3f} α={fit['alpha']:.3f} β={fit['beta']:.3f} "
+                   f"(n={alpha_beta_ratio(fit):.2f})\n"
+                   f"{len(flagged)} candles flagged | threshold {SCORE_THRESHOLD}")
 
-        print("6. Sending...")
+        print("5. Sending...")
         await send_photo(photo, caption)
-        print("7. Done.")
+        print("6. Done.")
 
     except Exception as e:
         print("ERROR:", str(e))
