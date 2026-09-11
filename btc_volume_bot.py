@@ -131,13 +131,13 @@ def flag_candles_from_events(event_times_ms, event_rates, kline_df):
 
 
 # --------------------------------------------------------------------------
-# Chart (FIXED FLAG MAPPING)
+# Chart (ONLY FIXED PART)
 # --------------------------------------------------------------------------
 def create_chart(kline_df, flagged_full, threshold):
     display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
     offset = len(kline_df) - len(display_df)
 
-    # FIXED: Proper mapping of historical flagged candles into visible window
+    # FIX: Correct mapping of historical flagged candles into visible window
     flagged = {}
     for idx, r in flagged_full.items():
         adj = idx - offset
