@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Hawkes Intensity Chart – fixed rolling version
-- Every trade is an event
-- Intensity for each bar is calculated ONLY from the last HAWKES_WINDOW minutes
-  (fully local → bursts appear anywhere on the chart)
-- Full z-score series shown on every bar
-- Volume on twin axis
-- Same candles + Telegram style as your original
+Pure continuous Hawkes process on raw trade tape.
+- No candle-awareness in the Hawkes calc at all
+- Intensity updates at every single trade (canonical recursive exponential kernel)
+- Z-score computed at trade-level over a rolling TIME window
+- Events (z >= threshold) are then mapped onto whichever 1m candle contains them
+- Candles get flagged/marked, not colored bar-by-bar
 """
 
 import asyncio
@@ -25,18 +24,18 @@ from matplotlib.patches import Rectangle
 SYMBOL = "BTCUSDT"
 
 VISIBLE_CANDLES = 200
-CALC_LOOKBACK = 30          # z-score lookback (bars)
-HAWKES_WINDOW = 5           # minutes of tape used for each bar's intensity (short = more reactive)
-STD_MULT = 2.0
+Z_LOOKBACK_SEC = 60         # rolling time window (sec) for trade-level z-score
+STD_MULT = 2.5              # threshold to flag an event
 
-# Hawkes parameters
-MU = 0.1
-ALPHA = 1.2
-BETA = 0.25                 # faster decay so recent clusters stand out
+# Hawkes parameters -- n = ALPHA/BETA MUST be < 1 for stability
+MU = 0.05
+ALPHA = 0.4
+BETA = 0.6                  # n = 0.4/0.6 = 0.67
 
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
 
 # --------------------------------------------------------------------------
 # Fetch Klines
@@ -110,157 +109,125 @@ async def fetch_all_trade_times(session, symbol, start_ms, end_ms):
 
 
 # --------------------------------------------------------------------------
-# Fully local / rolling Hawkes intensity for every bar
+# PURE continuous Hawkes at trade level -> event list
 # --------------------------------------------------------------------------
-def compute_rolling_hawkes(trade_times_ms, bar_close_ms,
-                           window_minutes=HAWKES_WINDOW,
-                           mu=MU, alpha=ALPHA, beta=BETA):
-    """
-    For each bar close T:
-      use ONLY trades in [T - window_minutes, T]
-      run recursive Hawkes on that local window
-      sample intensity at T
-    This keeps intensity reactive to local bursts anywhere on the chart.
-    """
-    window_ms = int(window_minutes * 60 * 1000)
-    n = len(bar_close_ms)
+def compute_trade_level_hawkes_events(trade_times_ms, mu=MU, alpha=ALPHA, beta=BETA,
+                                        z_lookback_sec=Z_LOOKBACK_SEC, std_mult=STD_MULT):
+    n = len(trade_times_ms)
+    if n == 0:
+        return [], np.array([])
+
     intensities = np.zeros(n)
+    lam = mu
+    t_cur = None
 
-    left = 0
-    for i, t_close in enumerate(bar_close_ms):
-        t_start = t_close - window_ms
-
-        while left < len(trade_times_ms) and trade_times_ms[left] < t_start:
-            left += 1
-
-        right = left
-        while right < len(trade_times_ms) and trade_times_ms[right] <= t_close:
-            right += 1
-
-        local = trade_times_ms[left:right]
-
-        if len(local) == 0:
-            intensities[i] = mu
-            continue
-
-        times_s = local.astype(np.float64) / 1000.0
-        t_close_s = t_close / 1000.0
-
-        lam = mu
-        t_cur = times_s[0] - 1e-6
-
-        for ts in times_s:
+    # pass 1: continuous recursive intensity, one update per trade, no resets
+    for i in range(n):
+        ts = trade_times_ms[i] / 1000.0
+        if t_cur is not None:
             dt = ts - t_cur
             if dt > 0:
                 lam = mu + (lam - mu) * np.exp(-beta * dt)
-            lam += alpha
-            t_cur = ts
+        lam += alpha
+        t_cur = ts
+        intensities[i] = lam
 
-        dt = t_close_s - t_cur
-        if dt > 0:
-            lam = mu + (lam - mu) * np.exp(-beta * dt)
+    # pass 2: rolling TIME-window z-score per trade
+    events = []
+    times_s = trade_times_ms.astype(np.float64) / 1000.0
+    left = 0
+    for i in range(n):
+        t_now = times_s[i]
+        while times_s[left] < t_now - z_lookback_sec:
+            left += 1
+        window = intensities[left:i + 1]
+        if len(window) < 10:
+            continue
+        mean = np.mean(window)
+        std = np.std(window)
+        if std < 1e-12:
+            continue
+        z = (intensities[i] - mean) / std
+        if z >= std_mult:
+            events.append((trade_times_ms[i], z))
 
-        intensities[i] = max(lam, 0.0)
+    return events, intensities
 
-    return intensities
+
+# --------------------------------------------------------------------------
+# Map trade-level events onto candles
+# --------------------------------------------------------------------------
+def flag_candles_from_events(events, kline_df):
+    open_ms = (kline_df["open_time"].astype(np.int64) // 1_000_000).values  # ns -> ms
+    flagged = {}
+    for t_ms, z in events:
+        idx = np.searchsorted(open_ms, t_ms, side="right") - 1
+        if idx < 0 or idx >= len(kline_df):
+            continue
+        if idx not in flagged or z > flagged[idx]:
+            flagged[idx] = z
+    return flagged  # {candle_index: peak_z}
 
 
 # --------------------------------------------------------------------------
 # Create Chart
 # --------------------------------------------------------------------------
-def create_chart(kline_df, intensities):
+def create_chart(kline_df, flagged_full):
     display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
-    display_intensities = intensities[-VISIBLE_CANDLES:]
+    offset = len(kline_df) - len(display_df)
 
-    # Full z-score for every bar
-    bar_values = []
-    bar_colors = []
-
-    for i in range(len(display_df)):
-        window = display_intensities[max(0, i - CALC_LOOKBACK + 1): i + 1]
-
-        if len(window) < 5:
-            bar_values.append(0.0)
-            bar_colors.append("#555555")
-            continue
-
-        mean = np.mean(window)
-        std = np.std(window)
-        if std < 1e-12:
-            bar_values.append(0.0)
-            bar_colors.append("#555555")
-            continue
-
-        z = (display_intensities[i] - mean) / std
-        bar_values.append(z)
-
-        if z >= STD_MULT:
-            bar_colors.append("#00ff88")
-        elif z <= -STD_MULT:
-            bar_colors.append("#ff4466")
-        elif z > 0:
-            bar_colors.append("#66ffaa")
-        else:
-            bar_colors.append("#888888")
+    # remap flagged indices into display_df's local indexing
+    flagged = {idx - offset: z for idx, z in flagged_full.items()
+               if 0 <= idx - offset < len(display_df)}
 
     volumes = display_df["volume"].astype(float).values
 
-    # ---------- Plot ----------
-    fig = plt.figure(figsize=(18, 10), facecolor="black")
-    gs = fig.add_gridspec(2, 1, height_ratios=[2.8, 1.4], hspace=0.07)
+    fig, ax_candle = plt.subplots(figsize=(18, 8), facecolor="black")
+    ax_candle.set_facecolor("black")
+    ax_candle.tick_params(colors="white")
+    for spine in ax_candle.spines.values():
+        spine.set_color("white")
 
-    ax_candle = fig.add_subplot(gs[0])
-    ax_out = fig.add_subplot(gs[1], sharex=ax_candle)
-
-    for ax in [ax_candle, ax_out]:
-        ax.set_facecolor("black")
-        ax.tick_params(colors="white")
-        for spine in ax.spines.values():
-            spine.set_color("white")
-
-    # Candlesticks
     width = 0.6
     for idx, row in display_df.iterrows():
         color = "#00ff88" if row["close"] >= row["open"] else "#ff4466"
         ax_candle.plot([idx, idx], [row["low"], row["high"]], color=color, linewidth=0.7)
         body_low = min(row["open"], row["close"])
         body_height = abs(row["close"] - row["open"]) or 0.01
-        rect = Rectangle((idx - width/2, body_low), width, body_height,
-                         facecolor=color, edgecolor=color)
+        rect = Rectangle((idx - width / 2, body_low), width, body_height,
+                          facecolor=color, edgecolor=color)
         ax_candle.add_patch(rect)
 
-    ax_candle.set_xlim(-1, VISIBLE_CANDLES)
+    # mark flagged candles with a star above the high + z-score label
+    for idx, z in flagged.items():
+        high = display_df["high"].iloc[idx]
+        span = display_df["high"].max() - display_df["low"].min()
+        y = high + span * 0.02
+        ax_candle.plot(idx, y, marker="*", color="#ffdd00", markersize=14, zorder=5)
+        ax_candle.text(idx, y + span * 0.015, f"z={z:.1f}", color="#ffdd00",
+                        fontsize=7, ha="center", zorder=5)
+
+    ax_candle.set_xlim(-1, len(display_df))
     ax_candle.set_title(
-        f"{SYMBOL} 1m  |  Visible: {VISIBLE_CANDLES}  |  Hawkes window: {HAWKES_WINDOW}m  |  Z-lookback: {CALC_LOOKBACK}\n"
-        f"Local Hawkes Z-Score (all bars) + Volume  |  Green ≥ +{STD_MULT}σ  |  Red ≤ –{STD_MULT}σ",
-        color="white", fontsize=12, pad=8
+        f"{SYMBOL} 1m  |  Pure Continuous Hawkes  |  μ={MU} α={ALPHA} β={BETA} (n={ALPHA/BETA:.2f})\n"
+        f"Flagged candles: {len(flagged)}  |  z_lookback={Z_LOOKBACK_SEC}s  |  threshold={STD_MULT}σ",
+        color="white", fontsize=12, pad=10
     )
     ax_candle.grid(True, color="#333333", alpha=0.4)
-    plt.setp(ax_candle.get_xticklabels(), visible=False)
 
-    # Hawkes z-score (all bars)
-    ax_out.bar(range(len(display_df)), bar_values, color=bar_colors, width=0.65, alpha=0.85, zorder=2)
-    ax_out.axhline(0, color="white", linewidth=0.8, alpha=0.5)
-    ax_out.axhline(STD_MULT, color="#00ff88", linewidth=0.6, linestyle="--", alpha=0.5)
-    ax_out.axhline(-STD_MULT, color="#ff4466", linewidth=0.6, linestyle="--", alpha=0.5)
-    ax_out.set_ylabel("Hawkes Z-Score", color="white")
-    ax_out.grid(True, color="#333333", alpha=0.4)
-
-    # Volume twin axis
-    ax_vol = ax_out.twinx()
-    ax_vol.bar(range(len(display_df)), volumes, color="#4488ff", width=0.65, alpha=0.25, zorder=1)
+    ax_vol = ax_candle.twinx()
+    ax_vol.bar(range(len(display_df)), volumes, color="#4488ff", width=0.65, alpha=0.2, zorder=0)
     ax_vol.set_ylabel("Volume", color="#4488ff")
     ax_vol.tick_params(axis="y", colors="#4488ff")
     ax_vol.spines["right"].set_color("#4488ff")
-    ax_vol.set_ylim(0, volumes.max() * 1.15 if len(volumes) and volumes.max() > 0 else 1)
+    ax_vol.set_ylim(0, volumes.max() * 4 if len(volumes) and volumes.max() > 0 else 1)
 
-    step = max(1, VISIBLE_CANDLES // 12)
-    ax_out.set_xticks(range(0, VISIBLE_CANDLES, step))
-    labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, VISIBLE_CANDLES, step)]
-    ax_out.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
+    step = max(1, len(display_df) // 12)
+    ax_candle.set_xticks(range(0, len(display_df), step))
+    labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, len(display_df), step)]
+    ax_candle.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
 
     plt.tight_layout()
-
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=120, facecolor="black", edgecolor="none")
     buf.seek(0)
@@ -276,7 +243,7 @@ async def send_photo(photo_bytes, caption=""):
     data = aiohttp.FormData()
     data.add_field("chat_id", str(CHAT_ID))
     data.add_field("caption", caption)
-    data.add_field("photo", photo_bytes, filename="hawkes_intensity.png", content_type="image/png")
+    data.add_field("photo", photo_bytes, filename="hawkes_pure.png", content_type="image/png")
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, data=data, timeout=60) as resp:
@@ -295,40 +262,35 @@ async def main():
     try:
         print("1. Fetching klines...")
         async with aiohttp.ClientSession() as session:
-            extra = max(HAWKES_WINDOW, CALC_LOOKBACK) + 40
-            kline_df = await fetch_klines(session, SYMBOL, VISIBLE_CANDLES + extra)
+            kline_df = await fetch_klines(session, SYMBOL, VISIBLE_CANDLES + 40)
             print(f"   Got {len(kline_df)} klines")
 
             start_ms = int(kline_df["open_time"].iloc[0].timestamp() * 1000)
-            end_ms   = int(kline_df["open_time"].iloc[-1].timestamp() * 1000) + 60_000
+            end_ms = int(kline_df["open_time"].iloc[-1].timestamp() * 1000) + 60_000
 
             print("2. Fetching full trade tape...")
             trade_times = await fetch_all_trade_times(session, SYMBOL, start_ms, end_ms)
 
-        bar_close_ms = np.array(
-            [int(ts.timestamp() * 1000) + 60_000 for ts in kline_df["open_time"]],
-            dtype=np.int64
-        )
+        print("3. Running pure continuous Hawkes over trade tape...")
+        events, intensities = compute_trade_level_hawkes_events(trade_times)
+        print(f"   {len(events)} trade-level events crossed {STD_MULT}σ "
+              f"(n={ALPHA/BETA:.2f}, {'stable' if ALPHA/BETA < 1 else 'UNSTABLE - lower alpha or raise beta'})")
 
-        print("3. Computing local rolling Hawkes intensity...")
-        intensities = compute_rolling_hawkes(
-            trade_times, bar_close_ms,
-            window_minutes=HAWKES_WINDOW,
-            mu=MU, alpha=ALPHA, beta=BETA
-        )
-        print(f"   Intensity ready | last 5: {[round(x, 2) for x in intensities[-5:]]}")
+        print("4. Mapping events onto candles...")
+        flagged = flag_candles_from_events(events, kline_df)
+        print(f"   {len(flagged)} candles flagged")
 
-        print("4. Creating chart...")
-        photo = create_chart(kline_df, intensities)
+        print("5. Creating chart...")
+        photo = create_chart(kline_df, flagged)
         print(f"   Chart size: {len(photo)/1024:.1f} KB")
 
-        caption = (f"{SYMBOL} – Local Hawkes Z-Score (all bars) + Volume\n"
-                   f"Hawkes window: {HAWKES_WINDOW}m | Z-lookback: {CALC_LOOKBACK}\n"
-                   f"μ={MU} α={ALPHA} β={BETA}")
+        caption = (f"{SYMBOL} – Pure Continuous Hawkes\n"
+                   f"μ={MU} α={ALPHA} β={BETA} (n={ALPHA/BETA:.2f})\n"
+                   f"{len(flagged)} candles flagged | threshold {STD_MULT}σ")
 
-        print("5. Sending...")
+        print("6. Sending...")
         await send_photo(photo, caption)
-        print("6. Done.")
+        print("7. Done.")
 
     except Exception as e:
         print("ERROR:", str(e))
