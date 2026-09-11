@@ -5,3 +5,5 @@ websocket-client
 websockets
 matplotlib
 pandas
+numpy
+scipy
