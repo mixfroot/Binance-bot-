@@ -1,266 +1,397 @@
 #!/usr/bin/env python3
 """
-Trade-level rolling 60s arrival rate, fully independent of candle boundaries.
-- For every trade, look at the trailing 60s window ending at that trade
-- rate = (number of trades in that window) / 60
-- Take the 99th percentile of that rate series across the whole tape
-- Any trade whose window-rate >= 99th percentile flags its containing candle
+Volume Z-Score Bot - RED ONLY
+- Only alerts when Z-Score ≥ 6.0 (Red)
+- Green candle → needs any HTF Bearish
+- Red candle → needs any HTF Bullish
+- Simple alert: just "SYMBOL  🔴 RED"
 """
 
 import asyncio
-import io
-import traceback
+import json
+import statistics
+from collections import defaultdict, deque
+from typing import Deque, Dict, List, Optional, Set
 
 import aiohttp
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-from matplotlib.patches import Rectangle
+import websockets
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # CONFIG
-# --------------------------------------------------------------------------
-SYMBOL = "BTCUSDT"
-VISIBLE_CANDLES = 200
-ROLLING_SECONDS = 60
-PCTL = 99
+# ==========================================================================
+BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"  # rotate this
+CHAT_ID   = "6263967739"
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
-CHAT_ID = "6263967739"
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# Volume Z-Score settings
+TIMEFRAME   = "5m"
+Z_LENGTH    = 1000
+RED_THRESHOLD = 6.0          # Only this level alerts
 
+# Coin selection
+MIN_24H_VOLUME      = 50_000_000
+MAX_SYMBOLS         = 10
+VOLATILITY_LOOKBACK = 21
+MIN_CANDLE_MOVE_PCT = 0.01
+REFRESH_INTERVAL    = 3600
 
-# --------------------------------------------------------------------------
-# Fetch Klines
-# --------------------------------------------------------------------------
-async def fetch_klines(session, symbol, total_needed):
-    all_data = []
-    remaining = total_needed
-    end_time = None
-    while remaining > 0:
-        limit = min(1500, remaining)
-        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}"
-        if end_time:
-            url += f"&endTime={end_time}"
-        async with session.get(url, timeout=15) as resp:
-            data = await resp.json()
-        if not data:
-            break
-        all_data = data + all_data
-        remaining -= len(data)
-        end_time = data[0][0] - 1
-        if len(data) < limit:
-            break
-        await asyncio.sleep(0.2)
+HTF_LIST = ["5m", "15m", "1h", "4h"]
 
-    df = pd.DataFrame(all_data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore"
-    ])
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
-    return df.drop_duplicates(subset=["open_time"]).reset_index(drop=True)
+# ==========================================================================
+# STATE
+# ==========================================================================
+volumes: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=Z_LENGTH))
+
+# Only one cooldown now (for Red)
+red_cooldown: Dict[str, bool] = defaultdict(bool)
+
+structure = defaultdict(lambda: defaultdict(lambda: {
+    "sup": None, "res": None, "state": "neutral",
+    "prev_green": None, "prev_red": None,
+    "last_high": None, "last_low": None
+}))
+
+active_symbols: Set[str] = set()
+listener_tasks: Dict[str, asyncio.Task] = {}
+_http_session: Optional[aiohttp.ClientSession] = None
 
 
-# --------------------------------------------------------------------------
-# Fetch ALL trade times
-# --------------------------------------------------------------------------
-async def fetch_all_trade_times(session, symbol, start_ms, end_ms):
-    times = []
-    current_start = start_ms
-    print("   Fetching aggTrades...")
-    while current_start < end_ms:
-        url = (f"https://fapi.binance.com/fapi/v1/aggTrades"
-               f"?symbol={symbol}&startTime={current_start}&endTime={end_ms}&limit=1000")
-        async with session.get(url, timeout=20) as resp:
-            trades = await resp.json()
-        if not trades or not isinstance(trades, list):
-            break
-        for t in trades:
-            times.append(t["T"])
-        if len(trades) < 1000:
-            break
-        current_start = trades[-1]["T"] + 1
-        await asyncio.sleep(0.12)
-    times.sort()
-    print(f"   Collected {len(times):,} trades")
-    return np.array(times, dtype=np.int64)
-
-
-# --------------------------------------------------------------------------
-# Trade-level rolling 60s rate
-# --------------------------------------------------------------------------
-def compute_trade_level_rolling_rate(trade_times_ms, window_sec=ROLLING_SECONDS):
-    n = len(trade_times_ms)
-    window_ms = window_sec * 1000
-    rates = np.zeros(n)
-    left = 0
-    for i in range(n):
-        t_i = trade_times_ms[i]
-        t_start = t_i - window_ms
-        while trade_times_ms[left] < t_start:
-            left += 1
-        count = i - left + 1
-        rates[i] = count / window_sec
-    return rates
-
-
-def find_pctl_events(trade_times_ms, rates, pctl=PCTL):
-    threshold = np.percentile(rates, pctl)
-    mask = rates >= threshold
-    event_times = trade_times_ms[mask]
-    event_rates = rates[mask]
-    return event_times, event_rates, threshold
-
-
-# --------------------------------------------------------------------------
-# Map trade-level events onto candles
-# --------------------------------------------------------------------------
-def flag_candles_from_events(event_times_ms, event_rates, kline_df):
-    open_ms = (kline_df["open_time"].astype(np.int64) // 1_000_000).values
-    flagged = {}
-    for t_ms, r in zip(event_times_ms, event_rates):
-        idx = np.searchsorted(open_ms, t_ms, side="right") - 1
-        if idx < 0 or idx >= len(kline_df):
-            continue
-        if idx not in flagged or r > flagged[idx]:
-            flagged[idx] = r
-    return flagged
-
-
-# --------------------------------------------------------------------------
-# Chart (ONLY FIXED PART)
-# --------------------------------------------------------------------------
-def create_chart(kline_df, flagged_full, threshold):
-    display_df = kline_df.tail(VISIBLE_CANDLES).copy().reset_index(drop=True)
-    offset = len(kline_df) - len(display_df)
-
-    # FIX: Correct mapping of historical flagged candles into visible window
-    flagged = {}
-    for idx, r in flagged_full.items():
-        adj = idx - offset
-        if 0 <= adj < len(display_df):
-            flagged[adj] = r
-
-    volumes = display_df["volume"].astype(float).values
-
-    fig, ax_candle = plt.subplots(figsize=(18, 8), facecolor="black")
-    ax_candle.set_facecolor("black")
-    ax_candle.tick_params(colors="white")
-    for spine in ax_candle.spines.values():
-        spine.set_color("white")
-
-    width = 0.6
-    for idx, row in display_df.iterrows():
-        color = "#00ff88" if row["close"] >= row["open"] else "#ff4466"
-        ax_candle.plot([idx, idx], [row["low"], row["high"]], color=color, linewidth=0.7)
-        body_low = min(row["open"], row["close"])
-        body_height = abs(row["close"] - row["open"]) or 0.01
-        rect = Rectangle((idx - width / 2, body_low), width, body_height,
-                          facecolor=color, edgecolor=color)
-        ax_candle.add_patch(rect)
-
-    span = display_df["high"].max() - display_df["low"].min()
-    for idx, r in flagged.items():
-        y = display_df["high"].iloc[idx] + span * 0.02
-        ax_candle.plot(idx, y, marker="*", color="#ffdd00", markersize=14, zorder=5)
-        ax_candle.text(idx, y + span * 0.015, f"{r:.1f}/s", color="#ffdd00",
-                        fontsize=7, ha="center", zorder=5)
-
-    ax_candle.set_xlim(-1, len(display_df))
-    ax_candle.set_title(
-        f"{SYMBOL} 1m  |  Trade-level rolling {ROLLING_SECONDS}s rate  |  "
-        f"{PCTL}th pctl = {threshold:.2f} trades/sec\n"
-        f"Flagged candles: {len(flagged)}",
-        color="white", fontsize=12, pad=10
-    )
-    ax_candle.grid(True, color="#333333", alpha=0.4)
-
-    ax_vol = ax_candle.twinx()
-    ax_vol.bar(range(len(display_df)), volumes, color="#4488ff", width=0.65, alpha=0.2, zorder=0)
-    ax_vol.set_ylabel("Volume", color="#4488ff")
-    ax_vol.tick_params(axis="y", colors="#4488ff")
-    ax_vol.spines["right"].set_color("#4488ff")
-    ax_vol.set_ylim(0, volumes.max() * 4 if len(volumes) and volumes.max() > 0 else 1)
-
-    step = max(1, len(display_df) // 12)
-    ax_candle.set_xticks(range(0, len(display_df), step))
-    labels = [display_df["open_time"].iloc[i].strftime("%m-%d %H:%M") for i in range(0, len(display_df), step)]
-    ax_candle.set_xticklabels(labels, rotation=45, color="white", fontsize=8)
-
-    plt.tight_layout()
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=120, facecolor="black", edgecolor="none")
-    buf.seek(0)
-    plt.close()
-    return buf.getvalue()
-
-
-# --------------------------------------------------------------------------
-# Send Photo
-# --------------------------------------------------------------------------
-async def send_photo(photo_bytes, caption=""):
-    url = f"{TELEGRAM_API_URL}/sendPhoto"
-    data = aiohttp.FormData()
-    data.add_field("chat_id", str(CHAT_ID))
-    data.add_field("caption", caption)
-    data.add_field("photo", photo_bytes, filename="rolling_rate_pctl.png", content_type="image/png")
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=data, timeout=60) as resp:
-            text = await resp.text()
-            print(f"Telegram status: {resp.status}")
-            if resp.status == 200:
-                print("Photo sent successfully!")
-            else:
-                print("Failed:", text[:300])
-
-
-# --------------------------------------------------------------------------
-# MAIN
-# --------------------------------------------------------------------------
-async def main():
+# ==========================================================================
+# TELEGRAM
+# ==========================================================================
+async def send_telegram(text: str):
+    global _http_session
     try:
-        print("1. Fetching klines...")
-        async with aiohttp.ClientSession() as session:
-            kline_df = await fetch_klines(session, SYMBOL, VISIBLE_CANDLES + 5)
-            print(f"   Got {len(kline_df)} klines")
-
-            start_ms = int(kline_df["open_time"].iloc[0].timestamp() * 1000) - ROLLING_SECONDS * 1000
-            end_ms = int(kline_df["open_time"].iloc[-1].timestamp() * 1000) + 60_000
-
-            print("2. Fetching full trade tape...")
-            trade_times = await fetch_all_trade_times(session, SYMBOL, start_ms, end_ms)
-
-        print("3. Computing trade-level rolling 60s rate...")
-        rates = compute_trade_level_rolling_rate(trade_times)
-        print(f"   rate range: min={rates.min():.2f} max={rates.max():.2f} "
-              f"median={np.median(rates):.2f} trades/sec")
-
-        print(f"4. Finding {PCTL}th percentile events...")
-        event_times, event_rates, threshold = find_pctl_events(trade_times, rates)
-        print(f"   threshold={threshold:.2f} trades/sec | {len(event_times)} trades crossed it")
-
-        print("5. Mapping events onto candles...")
-        flagged = flag_candles_from_events(event_times, event_rates, kline_df)
-        print(f"   {len(flagged)} candles flagged")
-
-        print("6. Creating chart...")
-        photo = create_chart(kline_df, flagged, threshold)
-        print(f"   Chart size: {len(photo)/1024:.1f} KB")
-
-        caption = (f"{SYMBOL} – Trade-level {ROLLING_SECONDS}s rolling rate, {PCTL}th percentile\n"
-                   f"threshold={threshold:.2f} trades/sec | {len(flagged)} candles flagged")
-
-        print("7. Sending...")
-        await send_photo(photo, caption)
-        print("8. Done.")
-
+        if _http_session is None or _http_session.closed:
+            _http_session = aiohttp.ClientSession()
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+        async with _http_session.post(TELEGRAM_API_URL, json=payload, timeout=10) as resp:
+            if resp.status != 200:
+                print(f"[TG] Error {resp.status}: {await resp.text()}")
     except Exception as e:
-        print("ERROR:", str(e))
-        traceback.print_exc()
+        print(f"[TG] Exception: {e}")
+
+
+# ==========================================================================
+# SUPPORT / RESISTANCE STRUCTURE
+# ==========================================================================
+def update_structure(symbol: str, tf: str, o: float, h: float, l: float, c: float, is_closed: bool) -> bool:
+    s = structure[symbol][tf]
+
+    green = c > o
+    red = c < o
+
+    prev_green = s.get("prev_green")
+    prev_red = s.get("prev_red")
+
+    green_to_red = prev_green and red
+    red_to_green = prev_red and green
+
+    if green_to_red:
+        s["res"] = max(h, s.get("last_high") or h)
+    if red_to_green:
+        s["sup"] = min(l, s.get("last_low") or l)
+
+    if red and not green_to_red and s["res"] is not None and h > s["res"]:
+        s["res"] = h
+    if green and not red_to_green and s["sup"] is not None and l < s["sup"]:
+        s["sup"] = l
+
+    if s["sup"] is not None and l < s["sup"] and c > s["sup"]:
+        s["sup"] = l
+
+    if is_closed:
+        old_state = s["state"]
+
+        if s["res"] is not None and c > s["res"]:
+            s["state"] = "bullish"
+            s["res"] = None
+        elif s["sup"] is not None and c < s["sup"]:
+            s["state"] = "bearish"
+            s["sup"] = None
+
+        s["prev_green"] = green
+        s["prev_red"] = red
+        s["last_high"] = h
+        s["last_low"] = l
+        return old_state != s["state"]
+
+    s["prev_green"] = green
+    s["prev_red"] = red
+    s["last_high"] = h
+    s["last_low"] = l
+    return False
+
+
+async def get_htf_states(symbol: str) -> Dict[str, str]:
+    results = {}
+    async with aiohttp.ClientSession() as session:
+        for tf in HTF_LIST:
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={tf}&limit=12"
+            try:
+                async with session.get(url, timeout=8) as resp:
+                    data = await resp.json()
+                    if not isinstance(data, list) or not data:
+                        results[tf] = "neutral"
+                        continue
+
+                    for candle in data[:-1]:
+                        o = float(candle[1])
+                        h = float(candle[2])
+                        l = float(candle[3])
+                        c = float(candle[4])
+                        update_structure(symbol, tf, o, h, l, c, is_closed=True)
+
+                    results[tf] = structure[symbol][tf]["state"]
+            except Exception as e:
+                print(f"[HTF] {symbol} {tf} error: {e}")
+                results[tf] = "neutral"
+    return results
+
+
+# ==========================================================================
+# Z-SCORE
+# ==========================================================================
+def calc_zscore(vols: Deque[float]) -> Optional[float]:
+    if len(vols) < 2:
+        return None
+    try:
+        avg = statistics.mean(vols)
+        std = statistics.stdev(vols)
+        if std == 0:
+            return 0.0
+        return (vols[-1] - avg) / std
+    except statistics.StatisticsError:
+        return None
+
+
+# ==========================================================================
+# HISTORICAL LOAD
+# ==========================================================================
+async def load_historical(session: aiohttp.ClientSession, symbol: str) -> bool:
+    url = (
+        f"https://fapi.binance.com/fapi/v1/klines"
+        f"?symbol={symbol}&interval={TIMEFRAME}&limit={Z_LENGTH + 1}"
+    )
+    try:
+        async with session.get(url, timeout=12) as resp:
+            data = await resp.json()
+            if not isinstance(data, list) or len(data) < 10:
+                return False
+
+            closed = data[:-1]
+            vols = [float(c[5]) for c in closed]
+            volumes[symbol].clear()
+            volumes[symbol].extend(vols[-Z_LENGTH:])
+            print(f"[HIST] {symbol} loaded {len(volumes[symbol])} bars")
+            return True
+    except Exception as e:
+        print(f"[HIST] {symbol} failed: {e}")
+        return False
+
+
+# ==========================================================================
+# COIN SELECTION
+# ==========================================================================
+async def has_volatile_15m(session: aiohttp.ClientSession, symbol: str) -> bool:
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit={VOLATILITY_LOOKBACK + 1}"
+    try:
+        async with session.get(url, timeout=8) as resp:
+            data = await resp.json()
+            if not isinstance(data, list) or len(data) < 2:
+                return False
+            for candle in data[:-1]:
+                o = float(candle[1])
+                c = float(candle[4])
+                if o > 0 and abs(c - o) / o >= MIN_CANDLE_MOVE_PCT:
+                    return True
+            return False
+    except Exception:
+        return False
+
+
+async def select_symbols() -> List[str]:
+    print("[SELECT] Fetching 24h tickers...")
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15) as resp:
+            tickers = await resp.json()
+
+        if not isinstance(tickers, list):
+            return []
+
+        candidates = []
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT"):
+                continue
+            try:
+                vol = float(t.get("quoteVolume", 0))
+            except (TypeError, ValueError):
+                continue
+            if vol >= MIN_24H_VOLUME:
+                candidates.append((sym, vol))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        print(f"[SELECT] {len(candidates)} coins ≥ {MIN_24H_VOLUME/1e6:.0f}M")
+
+        selected = []
+        for sym, vol in candidates:
+            if len(selected) >= MAX_SYMBOLS:
+                break
+            if await has_volatile_15m(session, sym):
+                selected.append(sym)
+                print(f"[SELECT] ✅ {sym}  {vol/1e6:.1f}M")
+            else:
+                print(f"[SELECT] ❌ {sym}")
+
+        return selected
+
+
+# ==========================================================================
+# WEBSOCKET LISTENER
+# ==========================================================================
+async def kline_listener(symbol: str):
+    stream = f"{symbol.lower()}@kline_{TIMEFRAME}"
+    url = f"wss://fstream.binance.com/market/ws/{stream}"
+
+    backoff = 2
+    while symbol in active_symbols:
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=12) as ws:
+                print(f"[WS] Connected {symbol} {TIMEFRAME}")
+                backoff = 2
+
+                async for raw in ws:
+                    if symbol not in active_symbols:
+                        break
+                    try:
+                        msg = json.loads(raw)
+                        k = msg["k"]
+                        if not k["x"]:
+                            continue
+
+                        o = float(k["o"])
+                        c = float(k["c"])
+                        vol = float(k["v"])
+
+                        volumes[symbol].append(vol)
+                        z = calc_zscore(volumes[symbol])
+                        if z is None:
+                            continue
+
+                        # Reset Red cooldown on any bar below Red threshold
+                        if z < RED_THRESHOLD:
+                            if red_cooldown[symbol]:
+                                print(f"[RESET] {symbol} Red cooldown cleared (Z={z:.2f})")
+                            red_cooldown[symbol] = False
+                            continue
+
+                        # Already on Red cooldown?
+                        if red_cooldown[symbol]:
+                            continue
+
+                        # ========== HTF FILTER ==========
+                        is_green = c > o
+                        is_red = c < o
+
+                        htf_states = await get_htf_states(symbol)
+
+                        any_bearish = any(st == "bearish" for st in htf_states.values())
+                        any_bullish = any(st == "bullish" for st in htf_states.values())
+
+                        allowed = False
+                        if is_green and any_bearish:
+                            allowed = True
+                        elif is_red and any_bullish:
+                            allowed = True
+
+                        if not allowed:
+                            print(f"[FILTER] {symbol} RED blocked by HTF")
+                            continue
+
+                        # ===== SEND RED ALERT =====
+                        red_cooldown[symbol] = True
+                        alert_msg = f"<b>{symbol}</b>  🔴 RED"
+                        print(f"[ALERT] {symbol} 🔴 RED  Z={z:.2f}")
+                        await send_telegram(alert_msg)
+
+                    except Exception as e:
+                        print(f"[WS] Parse error {symbol}: {e}")
+
+        except Exception as e:
+            if symbol not in active_symbols:
+                break
+            print(f"[WS] {symbol} disconnected: {e} → retry in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+    print(f"[WS] Stopped {symbol}")
+
+
+# ==========================================================================
+# SYMBOL MANAGER
+# ==========================================================================
+async def refresh_symbols():
+    global active_symbols, listener_tasks
+
+    new_list = await select_symbols()
+    new_set = set(new_list)
+
+    for sym in list(active_symbols - new_set):
+        active_symbols.discard(sym)
+        task = listener_tasks.pop(sym, None)
+        if task and not task.done():
+            task.cancel()
+        volumes.pop(sym, None)
+        red_cooldown.pop(sym, None)
+        structure.pop(sym, None)
+        print(f"[MGR] Removed {sym}")
+
+    async with aiohttp.ClientSession() as session:
+        for sym in new_set - active_symbols:
+            ok = await load_historical(session, sym)
+            if not ok:
+                print(f"[MGR] Skipping {sym}")
+                continue
+            active_symbols.add(sym)
+            listener_tasks[sym] = asyncio.create_task(kline_listener(sym))
+            print(f"[MGR] Started {sym}")
+
+    if new_list:
+        await send_telegram(
+            "🔄 <b>Active coins updated</b>\n" +
+            "\n".join(f"• {s}" for s in new_list)
+        )
+    else:
+        await send_telegram("⚠️ No coins passed the filters")
+
+
+async def symbol_refresher():
+    while True:
+        try:
+            await refresh_symbols()
+        except Exception as e:
+            print(f"[REFRESH] {e}")
+            await send_telegram(f"⚠️ Refresh failed: {e}")
+        await asyncio.sleep(REFRESH_INTERVAL)
+
+
+# ==========================================================================
+# MAIN
+# ==========================================================================
+async def main():
+    print("Volume Z-Score RED ONLY Bot starting...")
+    await send_telegram(
+        f"Bot started ✅\n"
+        f"TF: {TIMEFRAME} | Max coins: {MAX_SYMBOLS}\n"
+        f"Only 🔴 RED alerts (Z ≥ {RED_THRESHOLD})"
+    )
+    await refresh_symbols()
+    await symbol_refresher()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Stopped.")
