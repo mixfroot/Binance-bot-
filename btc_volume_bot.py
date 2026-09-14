@@ -24,7 +24,7 @@ CHAT_ID   = "6263967739"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 # Volume Z-Score settings
-TIMEFRAME   = "5m"          # change to "1m" if you want
+TIMEFRAME   = "1m"          # change to "1m" if you want
 Z_LENGTH    = 1000
 ALERT_Z_MIN = 1.5
 
