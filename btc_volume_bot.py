@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Volume Z-Score Bot - RED ONLY
-- Only alerts when Z-Score ≥ 6.0 (Red)
+Volume Z-Score Bot + HTF Structure Filter
+- Simple alerts: only "SYMBOL  COLOR"
+- Each color has independent cooldown (set only when alert is sent)
 - Green candle → needs any HTF Bearish
 - Red candle → needs any HTF Bullish
-- Simple alert: just "SYMBOL  🔴 RED"
 """
 
 import asyncio
 import json
 import statistics
 from collections import defaultdict, deque
-from typing import Deque, Dict, List, Optional, Set
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import websockets
@@ -24,16 +24,23 @@ CHAT_ID   = "6263967739"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 # Volume Z-Score settings
-TIMEFRAME   = "5m"
+TIMEFRAME   = "5m"          # change to "1m" if you want
 Z_LENGTH    = 1000
-RED_THRESHOLD = 6.0          # Only this level alerts
+ALERT_Z_MIN = 1.5
+
+LEVELS = [
+    (6.0, "red",    "🔴 RED"),
+    (4.5, "orange", "🟠 ORANGE"),
+    (3.0, "yellow", "🟡 YELLOW"),
+    (1.5, "green",  "🟢 GREEN"),
+]
 
 # Coin selection
 MIN_24H_VOLUME      = 50_000_000
 MAX_SYMBOLS         = 10
 VOLATILITY_LOOKBACK = 21
 MIN_CANDLE_MOVE_PCT = 0.01
-REFRESH_INTERVAL    = 3600
+REFRESH_INTERVAL    = 3600          # 1 hour
 
 HTF_LIST = ["5m", "15m", "1h", "4h"]
 
@@ -42,8 +49,9 @@ HTF_LIST = ["5m", "15m", "1h", "4h"]
 # ==========================================================================
 volumes: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=Z_LENGTH))
 
-# Only one cooldown now (for Red)
-red_cooldown: Dict[str, bool] = defaultdict(bool)
+cooldown: Dict[str, Dict[str, bool]] = defaultdict(lambda: {
+    "red": False, "orange": False, "yellow": False, "green": False
+})
 
 structure = defaultdict(lambda: defaultdict(lambda: {
     "sup": None, "res": None, "state": "neutral",
@@ -165,6 +173,13 @@ def calc_zscore(vols: Deque[float]) -> Optional[float]:
         return None
 
 
+def get_level(z: float) -> Optional[Tuple[float, str, str]]:
+    for thresh, color, label in LEVELS:
+        if z >= thresh:
+            return thresh, color, label
+    return None
+
+
 # ==========================================================================
 # HISTORICAL LOAD
 # ==========================================================================
@@ -279,15 +294,22 @@ async def kline_listener(symbol: str):
                         if z is None:
                             continue
 
-                        # Reset Red cooldown on any bar below Red threshold
-                        if z < RED_THRESHOLD:
-                            if red_cooldown[symbol]:
-                                print(f"[RESET] {symbol} Red cooldown cleared (Z={z:.2f})")
-                            red_cooldown[symbol] = False
+                        # Reset all cooldowns on Gray / Navy
+                        if z < ALERT_Z_MIN:
+                            for color in list(cooldown[symbol].keys()):
+                                if cooldown[symbol][color]:
+                                    print(f"[RESET] {symbol} {color} cleared (Z={z:.2f})")
+                                cooldown[symbol][color] = False
                             continue
 
-                        # Already on Red cooldown?
-                        if red_cooldown[symbol]:
+                        level = get_level(z)
+                        if level is None:
+                            continue
+
+                        _, color, label = level
+
+                        # Already on cooldown for this specific color?
+                        if cooldown[symbol][color]:
                             continue
 
                         # ========== HTF FILTER ==========
@@ -306,13 +328,13 @@ async def kline_listener(symbol: str):
                             allowed = True
 
                         if not allowed:
-                            print(f"[FILTER] {symbol} RED blocked by HTF")
+                            print(f"[FILTER] {symbol} {label} blocked by HTF")
                             continue
 
-                        # ===== SEND RED ALERT =====
-                        red_cooldown[symbol] = True
-                        alert_msg = f"<b>{symbol}</b>  🔴 RED"
-                        print(f"[ALERT] {symbol} 🔴 RED  Z={z:.2f}")
+                        # ===== SEND ALERT (only here) =====
+                        cooldown[symbol][color] = True
+                        alert_msg = f"<b>{symbol}</b>  {label}"
+                        print(f"[ALERT] {symbol} {label}")
                         await send_telegram(alert_msg)
 
                     except Exception as e:
@@ -337,16 +359,18 @@ async def refresh_symbols():
     new_list = await select_symbols()
     new_set = set(new_list)
 
+    # Remove old
     for sym in list(active_symbols - new_set):
         active_symbols.discard(sym)
         task = listener_tasks.pop(sym, None)
         if task and not task.done():
             task.cancel()
         volumes.pop(sym, None)
-        red_cooldown.pop(sym, None)
+        cooldown.pop(sym, None)
         structure.pop(sym, None)
         print(f"[MGR] Removed {sym}")
 
+    # Add new
     async with aiohttp.ClientSession() as session:
         for sym in new_set - active_symbols:
             ok = await load_historical(session, sym)
@@ -380,11 +404,11 @@ async def symbol_refresher():
 # MAIN
 # ==========================================================================
 async def main():
-    print("Volume Z-Score RED ONLY Bot starting...")
+    print("Volume Z-Score + HTF Filter Bot starting...")
     await send_telegram(
         f"Bot started ✅\n"
         f"TF: {TIMEFRAME} | Max coins: {MAX_SYMBOLS}\n"
-        f"Only 🔴 RED alerts (Z ≥ {RED_THRESHOLD})"
+        f"Simple alerts: SYMBOL + COLOR only"
     )
     await refresh_symbols()
     await symbol_refresher()
