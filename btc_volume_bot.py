@@ -42,7 +42,7 @@ VOLATILITY_LOOKBACK = 21
 MIN_CANDLE_MOVE_PCT = 0.01
 REFRESH_INTERVAL    = 3600          # 1 hour
 
-HTF_LIST = ["5m", "15m", "1h", "4h"]
+HTF_LIST = ["15m", "1h", "4h"]
 
 # ==========================================================================
 # STATE
