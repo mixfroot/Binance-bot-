@@ -1,155 +1,118 @@
-import requests
+
+
+import argparse
+import io
 import time
-import statistics
-from datetime import datetime
-import traceback
+from datetime import datetime, timezone
 
-# ====================== CONFIG ======================
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+import pandas as pd
+import requests
+from arch import arch_model
+from matplotlib.patches import Rectangle
+
+# -------------------- Telegram credentials --------------------
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
-CHAT_ID   = "6263967739"
+CHAT_ID = "6263967739"
 
-SYMBOLS = ["TUTUSDT", "BTCUSDT", "SEIUSDT", "SUIUSDT"]
-PERIOD = "5m"
-LOOKBACK = 180
-STD_MULTIPLIER = 2.0
-HEARTBEAT_EVERY = 60        # minutes
-CHECK_INTERVAL = 40
-# ====================================================
+# -------------------- Defaults --------------------
+DEFAULT_SYMBOL = "BTCUSDT"
+DEFAULT_TIMEFRAME = "1m"
+DEFAULT_LOOKBACK = 300          # number of candles to fetch
+DEFAULT_GARCH_LOOKBACK = 16     # window used to estimate GARCH (or min obs)
+DEFAULT_MULTIPLIER = 2.0
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }, timeout=15)
-    except Exception as e:
-        print("Telegram send failed:", e)
 
-def get_oi_history(symbol, limit=180):
-    url = "https://fapi.binance.com/futures/data/openInterestHist"
+def fetch_binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    """Fetch recent klines from Binance public API."""
+    url = "https://api.binance.com/api/v3/klines"
     params = {
-        "symbol": symbol,
-        "period": PERIOD,
-        "limit": limit
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "limit": min(limit, 1000),  # Binance max 1000
     }
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
-    data = sorted(data, key=lambda x: x["timestamp"])
-    return data
+    if not data:
+        raise ValueError("Empty response from Binance")
 
-def calculate_deltas(data):
-    deltas = []
-    for i in range(1, len(data)):
-        curr = float(data[i]["sumOpenInterest"])
-        prev = float(data[i-1]["sumOpenInterest"])
-        deltas.append(curr - prev)
-    return deltas
-
-def process_symbol(symbol):
-    data = get_oi_history(symbol, LOOKBACK + 5)
-    
-    if len(data) < 30:
-        return None
-
-    deltas = calculate_deltas(data)
-    latest_delta = deltas[-1]
-    
-    window = deltas[-LOOKBACK:] if len(deltas) >= LOOKBACK else deltas
-    
-    mean = statistics.mean(window)
-    std = statistics.stdev(window) if len(window) > 1 else 0
-    
-    upper = mean + (STD_MULTIPLIER * std)
-    lower = mean - (STD_MULTIPLIER * std)
-    
-    is_extreme = latest_delta > upper or latest_delta < lower
-    
-    return {
-        "symbol": symbol,
-        "latest_delta": latest_delta,
-        "mean": mean,
-        "std": std,
-        "upper": upper,
-        "lower": lower,
-        "is_extreme": is_extreme,
-        "timestamp": data[-1]["timestamp"]
-    }
-
-def main():
-    send_telegram(
-        "🚀 <b>OI Delta Bot Started (5m)</b>\n"
-        "Tracking: TUT | BTC | SEI | SUI\n"
-        "I will send the latest delta once per coin, then only extreme (1σ) alerts."
+    df = pd.DataFrame(
+        data,
+        columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades", "taker_buy_base",
+            "taker_buy_quote", "ignore",
+        ],
     )
-    
-    last_timestamps = {s: None for s in SYMBOLS}
-    first_sent = {s: False for s in SYMBOLS}   # to send latest only once
-    last_heartbeat = time.time()
-    
-    print("Bot is running...")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    df = df.set_index("open_time")
+    return df[["open", "high", "low", "close", "volume"]]
 
-    while True:
-        try:
-            for symbol in SYMBOLS:
-                try:
-                    result = process_symbol(symbol)
-                    
-                    if result is None:
-                        continue
-                    
-                    # New candle detected
-                    if last_timestamps[symbol] is None or result["timestamp"] > last_timestamps[symbol]:
-                        last_timestamps[symbol] = result["timestamp"]
-                        time_str = datetime.fromtimestamp(result["timestamp"] / 1000).strftime("%H:%M")
-                        
-                        # Send latest delta only once (first time)
-                        if not first_sent[symbol]:
-                            msg = (
-                                f"✅ <b>{result['symbol']} Latest 5m OI Delta</b>\n\n"
-                                f"Time: {time_str}\n"
-                                f"Latest Delta: <b>{result['latest_delta']:,.0f}</b>\n"
-                                f"Mean: {result['mean']:,.0f} | 1σ: ±{result['std']:,.0f}\n\n"
-                                f"<i>Now only extreme alerts will be sent.</i>"
-                            )
-                            send_telegram(msg)
-                            first_sent[symbol] = True
-                            print(f"First update sent → {symbol}")
-                        
-                        # After first time → only send if extreme
-                        elif result["is_extreme"]:
-                            direction = "🟢 Positive" if result["latest_delta"] > 0 else "🔴 Negative"
-                            msg = (
-                                f"🚨 <b>{result['symbol']} 5m OI ALERT</b>\n\n"
-                                f"Time: {time_str}\n"
-                                f"Latest Delta: <b>{result['latest_delta']:,.0f}</b>\n"
-                                f"Mean: {result['mean']:,.0f}\n"
-                                f"1σ Range: {result['lower']:,.0f} → {result['upper']:,.0f}\n"
-                                f"{direction} extreme move"
-                            )
-                            send_telegram(msg)
-                            print(f"ALERT → {symbol} | {result['latest_delta']:,.0f}")
 
-                except Exception as e:
-                    error_msg = f"⚠️ Error on {symbol}:\n<code>{str(e)}</code>"
-                    send_telegram(error_msg)
-                    print(f"Error {symbol}:", e)
+def fit_garch11(returns: pd.Series, min_obs: int = 16):
+    """
+    Fit GARCH(1,1) on returns (in percent).
+    Returns: omega, alpha, beta, conditional_volatility series (aligned to returns index)
+    """
+    # scale to percent for numerical stability
+    rets = returns.dropna() * 100.0
+    if len(rets) < max(min_obs, 20):
+        raise ValueError(f"Need at least ~20 observations for GARCH, got {len(rets)}")
 
-            # Heartbeat
-            if time.time() - last_heartbeat > HEARTBEAT_EVERY * 60:
-                send_telegram(f"❤️ Heartbeat — Bot is alive\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                last_heartbeat = time.time()
+    # Use last `min_obs` or full series (user "lookback 16" treated as min window)
+    # We fit on the whole fetched series for a stable estimate, but allow short window
+    model = arch_model(rets, vol="Garch", p=1, q=1, mean="Zero", rescale=False)
+    res = model.fit(disp="off", show_warning=False)
 
-            time.sleep(CHECK_INTERVAL)
+    omega = float(res.params.get("omega", np.nan))
+    alpha = float(res.params.get("alpha[1]", np.nan))
+    beta = float(res.params.get("beta[1]", np.nan))
 
-        except Exception as e:
-            error_msg = f"❌ Critical error:\n<code>{str(e)}</code>\n\nReconnecting in 9 seconds..."
-            send_telegram(error_msg)
-            print("Critical error:", traceback.format_exc())
-            time.sleep(9)
+    # conditional volatility in percent → convert back to decimal
+    cond_vol = res.conditional_volatility / 100.0
+    cond_vol.index = rets.index
+    return omega, alpha, beta, cond_vol
 
-if __name__ == "__main__":
-    main()
+
+def plot_chart(
+    df: pd.DataFrame,
+    cond_vol: pd.Series,
+    omega: float,
+    alpha: float,
+    beta: float,
+    multiplier: float,
+    symbol: str,
+    timeframe: str,
+) -> bytes:
+    """Create black-background chart with candles + GARCH bands + bottom omega/vol panel."""
+    # Align
+    common_idx = df.index.intersection(cond_vol.index)
+    df = df.loc[common_idx]
+    vol = cond_vol.loc[common_idx]
+
+    # Bands: close ± multiplier * σ * close  (relative)
+    upper = df["close"] * (1.0 + multiplier * vol)
+    lower = df["close"] * (1.0 - multiplier * vol)
+
+    # Figure
+    fig = plt.figure(figsize=(14, 9), facecolor="#000000")
+    gs = fig.add_gridspec(3, 1, height_ratios=[3.2, 1.0, 0.15], hspace=0.08)
+
+    ax_price = fig.add_subplot(gs[0])
+    ax_vol = fig.add_subplot(gs[1], sharex=ax_price)
+    ax_info = fig.add_subplot(gs[2])
+
+    for ax in (ax_price, ax_vol, ax_info):
+        ax.set_facecolor("#000000")
+        ax.tick_params(colors="#cccccc", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#333333")
+
+    # ---- Candlesticks (manual
