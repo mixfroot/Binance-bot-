@@ -23,8 +23,8 @@ CHAT_ID = "6263967739"
 DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_TIMEFRAME = "1m"
 DEFAULT_LOOKBACK = 300          # number of candles to fetch
-DEFAULT_GARCH_LOOKBACK = 16     # window used to estimate GARCH (or min obs)
-DEFAULT_MULTIPLIER = 2.0
+DEFAULT_GARCH_LOOKBACK = 89     # window used to estimate GARCH (or min obs)
+DEFAULT_MULTIPLIER = 1.618
 
 
 def fetch_binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
