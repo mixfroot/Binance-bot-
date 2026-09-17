@@ -22,7 +22,7 @@ CHAT_ID = "6263967739"
 # -------------------- Defaults --------------------
 DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_TIMEFRAME = "1m"
-DEFAULT_LOOKBACK = 300          # number of candles to fetch
+DEFAULT_LOOKBACK = 400          # number of candles to fetch
 DEFAULT_GARCH_LOOKBACK = 89     # window used to estimate GARCH (or min obs)
 DEFAULT_MULTIPLIER = 1.618
 
