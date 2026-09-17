@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-Fetch Binance OHLCV (custom timeframe & lookback), rolling GARCH(1,1),
-plot candlestick + GARCH bands (black bg) + omega / vol panel,
-send PNG to Telegram.
-
-Rolling logic:
-  - First `garch_lookback` candles (default 16) are used for the initial fit.
-  - Then the window slides forward one bar at a time (fixed-size rolling window).
-"""
-
 import argparse
 import io
 import warnings
@@ -26,143 +16,96 @@ from matplotlib.patches import Rectangle
 
 warnings.filterwarnings("ignore")
 
-# -------------------- Telegram credentials --------------------
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
 
-# -------------------- Defaults --------------------
 DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_TIMEFRAME = "1m"
-DEFAULT_LOOKBACK = 400       # number of candles to fetch
-DEFAULT_GARCH_LOOKBACK = 88     # rolling window size
+DEFAULT_LOOKBACK = 2000
+DEFAULT_GARCH_WINDOW = 233
 DEFAULT_MULTIPLIER = 1.618
 
 
-def fetch_binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """Fetch recent klines from Binance public API (vision endpoint for broader access)."""
+def fetch_binance_klines(symbol, interval, limit):
     urls = [
         "https://data-api.binance.vision/api/v3/klines",
         "https://api.binance.com/api/v3/klines",
         "https://api1.binance.com/api/v3/klines",
     ]
-    params = {
-        "symbol": symbol.upper(),
-        "interval": interval,
-        "limit": min(limit, 1000),
-    }
-    last_err = None
-    data = None
-    for url in urls:
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            r.raise_for_status()
-            data = r.json()
+    all_rows = []
+    end_time = None
+    remaining = limit
+    while remaining > 0:
+        batch = min(remaining, 1000)
+        params = {"symbol": symbol.upper(), "interval": interval, "limit": batch}
+        if end_time is not None:
+            params["endTime"] = end_time
+        data, last_err = None, None
+        for url in urls:
+            try:
+                r = requests.get(url, params=params, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                break
+            except Exception as e:
+                last_err = e
+        if not data:
+            if not all_rows:
+                raise RuntimeError(f"All Binance endpoints failed: {last_err}")
             break
-        except Exception as e:
-            last_err = e
-            continue
-    if data is None:
-        raise RuntimeError(f"All Binance endpoints failed: {last_err}")
-    if not data:
-        raise ValueError("Empty response from Binance")
+        all_rows = data + all_rows
+        remaining -= len(data)
+        end_time = data[0][0] - 1
+        if len(data) < batch:
+            break
 
-    df = pd.DataFrame(
-        data,
-        columns=[
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trades", "taker_buy_base",
-            "taker_buy_quote", "ignore",
-        ],
-    )
+    df = pd.DataFrame(all_rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore",
+    ])
+    df = df.drop_duplicates(subset="open_time").sort_values("open_time")
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
     df = df.set_index("open_time")
-    return df[["open", "high", "low", "close", "volume"]]
+    return df[["open", "high", "low", "close", "volume"]].tail(limit)
 
 
-def rolling_garch11(returns: pd.Series, window: int = 16):
-    """
-    True rolling GARCH(1,1).
-
-    - First `window` returns are used for the initial estimation.
-    - Then the window slides forward one bar at a time.
-    - At each step we keep only the *latest* conditional volatility
-      and the fitted parameters (ω, α, β) of that window.
-    """
-    rets = returns.dropna() * 100.0          # percent scale for numerical stability
+def rolling_garch11(returns, window=150):
+    rets = returns.dropna() * 100.0
     n = len(rets)
-
     if n < window:
         raise ValueError(f"Need at least {window} returns, got {n}")
 
-    vol_list = [np.nan] * n
-    omega_list = [np.nan] * n
-    alpha_list = [np.nan] * n
-    beta_list = [np.nan] * n
-
+    vol = np.full(n, np.nan)
+    omega_arr = np.full(n, np.nan)
+    alpha_arr = np.full(n, np.nan)
+    beta_arr = np.full(n, np.nan)
     last_omega = last_alpha = last_beta = np.nan
 
     for i in range(window - 1, n):
-        # fixed-size rolling window ending at i
-        window_rets = rets.iloc[i - window + 1 : i + 1]
-
+        window_rets = rets.iloc[i - window + 1: i + 1]
         try:
-            model = arch_model(
-                window_rets,
-                vol="Garch",
-                p=1,
-                q=1,
-                mean="Zero",
-                rescale=False,
-            )
-            res = model.fit(disp="off", show_warning=False, options={"maxiter": 200})
-
-            omega = float(res.params.get("omega", np.nan))
-            alpha = float(res.params.get("alpha[1]", np.nan))
-            beta = float(res.params.get("beta[1]", np.nan))
-
-            # latest conditional vol of this window (in decimal)
-            cond_vol_pct = float(res.conditional_volatility.iloc[-1])
-            vol = cond_vol_pct / 100.0
-
-            vol_list[i] = vol
-            omega_list[i] = omega
-            alpha_list[i] = alpha
-            beta_list[i] = beta
-
-            last_omega, last_alpha, last_beta = omega, alpha, beta
-
+            model = arch_model(window_rets, vol="Garch", p=1, q=1, mean="Zero", rescale=False)
+            res = model.fit(disp="off", show_warning=False, options={"maxiter": 300})
+            last_omega = float(res.params["omega"])
+            last_alpha = float(res.params["alpha[1]"])
+            last_beta = float(res.params["beta[1]"])
+            vol[i] = float(res.conditional_volatility.iloc[-1]) / 100.0
         except Exception:
-            # if a window fails to converge, keep previous values
-            if i > 0 and not np.isnan(vol_list[i - 1]):
-                vol_list[i] = vol_list[i - 1]
-                omega_list[i] = omega_list[i - 1]
-                alpha_list[i] = alpha_list[i - 1]
-                beta_list[i] = beta_list[i - 1]
+            if i > 0 and not np.isnan(vol[i - 1]):
+                vol[i] = vol[i - 1]
+        omega_arr[i], alpha_arr[i], beta_arr[i] = last_omega, last_alpha, last_beta
 
     idx = rets.index
-    cond_vol = pd.Series(vol_list, index=idx)
-    omega_s = pd.Series(omega_list, index=idx)
-    alpha_s = pd.Series(alpha_list, index=idx)
-    beta_s = pd.Series(beta_list, index=idx)
-
-    return cond_vol, omega_s, alpha_s, beta_s, last_omega, last_alpha, last_beta
+    return (pd.Series(vol, index=idx), pd.Series(omega_arr, index=idx),
+            pd.Series(alpha_arr, index=idx), pd.Series(beta_arr, index=idx),
+            last_omega, last_alpha, last_beta)
 
 
-def plot_chart(
-    df: pd.DataFrame,
-    cond_vol: pd.Series,
-    omega_s: pd.Series,
-    last_omega: float,
-    last_alpha: float,
-    last_beta: float,
-    multiplier: float,
-    symbol: str,
-    timeframe: str,
-    window: int,
-) -> bytes:
-    """Black-background chart with candles + rolling GARCH bands + bottom panels."""
+def plot_chart(df, cond_vol, omega_s, last_omega, last_alpha, last_beta,
+               multiplier, symbol, timeframe, window):
     common_idx = df.index.intersection(cond_vol.dropna().index)
     df_plot = df.loc[common_idx]
     vol = cond_vol.loc[common_idx]
@@ -173,7 +116,6 @@ def plot_chart(
 
     fig = plt.figure(figsize=(14, 10), facecolor="#000000")
     gs = fig.add_gridspec(4, 1, height_ratios=[3.0, 0.9, 0.7, 0.18], hspace=0.10)
-
     ax_price = fig.add_subplot(gs[0])
     ax_vol = fig.add_subplot(gs[1], sharex=ax_price)
     ax_omega = fig.add_subplot(gs[2], sharex=ax_price)
@@ -185,73 +127,44 @@ def plot_chart(
         for spine in ax.spines.values():
             spine.set_color("#333333")
 
-    # ---- Candlesticks ----
     width = 0.6 * (df_plot.index[1] - df_plot.index[0]).total_seconds() / 86400.0 if len(df_plot) > 1 else 0.0005
     for ts, row in df_plot.iterrows():
         o, h, l, c = row["open"], row["high"], row["low"], row["close"]
         color = "#00e676" if c >= o else "#ff1744"
         ax_price.plot([ts, ts], [l, h], color=color, linewidth=0.9, solid_capstyle="round")
         body_low = min(o, c)
-        body_h = abs(c - o)
-        if body_h < 1e-12:
-            body_h = (h - l) * 0.02 or 1e-8
-        rect = Rectangle(
-            (mdates.date2num(ts) - width / 2, body_low),
-            width,
-            body_h,
-            facecolor=color,
-            edgecolor=color,
-            linewidth=0.5,
-            alpha=0.95,
-        )
+        body_h = abs(c - o) or ((h - l) * 0.02 or 1e-8)
+        rect = Rectangle((mdates.date2num(ts) - width / 2, body_low), width, body_h,
+                         facecolor=color, edgecolor=color, linewidth=0.5, alpha=0.95)
         ax_price.add_patch(rect)
 
-    # GARCH bands
-    ax_price.plot(df_plot.index, upper, color="#00bcd4", linewidth=1.4,
-                  label=f"Upper ({multiplier}×σ)", alpha=0.9)
-    ax_price.plot(df_plot.index, lower, color="#ff9800", linewidth=1.4,
-                  label=f"Lower ({multiplier}×σ)", alpha=0.9)
+    ax_price.plot(df_plot.index, upper, color="#00bcd4", linewidth=1.4, label=f"Upper ({multiplier}×σ)", alpha=0.9)
+    ax_price.plot(df_plot.index, lower, color="#ff9800", linewidth=1.4, label=f"Lower ({multiplier}×σ)", alpha=0.9)
     ax_price.fill_between(df_plot.index, lower, upper, color="#00bcd4", alpha=0.08)
-
     ax_price.set_ylabel("Price", color="#cccccc")
-    ax_price.legend(loc="upper left", fontsize=8, facecolor="#111111",
-                    edgecolor="#333333", labelcolor="#eeeeee")
-    ax_price.set_title(
-        f"{symbol}  |  {timeframe}  |  Rolling GARCH(1,1)  window={window}  mult={multiplier}",
-        color="#ffffff", fontsize=12, pad=8,
-    )
+    ax_price.legend(loc="upper left", fontsize=8, facecolor="#111111", edgecolor="#333333", labelcolor="#eeeeee")
+    ax_price.set_title(f"{symbol}  |  {timeframe}  |  Rolling GARCH(1,1)  window={window}  mult={multiplier}",
+                       color="#ffffff", fontsize=12, pad=8)
     ax_price.grid(True, color="#222222", linestyle="--", linewidth=0.5)
     ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=timezone.utc))
 
-    # ---- Conditional volatility panel ----
     ax_vol.plot(vol.index, vol * 100, color="#e040fb", linewidth=1.3, label="Cond. Vol (%)")
     ax_vol.fill_between(vol.index, 0, vol * 100, color="#e040fb", alpha=0.15)
     ax_vol.set_ylabel("σ (%)", color="#cccccc")
-    ax_vol.legend(loc="upper left", fontsize=8, facecolor="#111111",
-                  edgecolor="#333333", labelcolor="#eeeeee")
+    ax_vol.legend(loc="upper left", fontsize=8, facecolor="#111111", edgecolor="#333333", labelcolor="#eeeeee")
     ax_vol.grid(True, color="#222222", linestyle="--", linewidth=0.5)
 
-    # ---- Omega (ω) panel ----
     ax_omega.plot(omegas.index, omegas, color="#ffeb3b", linewidth=1.2, label="ω (omega)")
     ax_omega.set_ylabel("ω", color="#cccccc")
-    ax_omega.legend(loc="upper left", fontsize=8, facecolor="#111111",
-                    edgecolor="#333333", labelcolor="#eeeeee")
+    ax_omega.legend(loc="upper left", fontsize=8, facecolor="#111111", edgecolor="#333333", labelcolor="#eeeeee")
     ax_omega.grid(True, color="#222222", linestyle="--", linewidth=0.5)
 
-    # ---- Info bar ----
     ax_info.axis("off")
-    info_txt = (
-        f"Latest →  ω = {last_omega:.6e}   |   α = {last_alpha:.4f}   |   β = {last_beta:.4f}   |   "
-        f"α+β = {last_alpha + last_beta:.4f}   |   rolling window = {window}   |   "
-        f"candles = {len(df_plot)}   |   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-    )
-    ax_info.text(
-        0.5, 0.5, info_txt,
-        transform=ax_info.transAxes,
-        ha="center", va="center",
-        color="#aaaaaa", fontsize=9,
-        family="monospace",
-    )
+    info_txt = (f"Latest →  ω = {last_omega:.6e}   |   α = {last_alpha:.4f}   |   β = {last_beta:.4f}   |   "
+                f"α+β = {last_alpha + last_beta:.4f}   |   window = {window}   |   "
+                f"candles = {len(df_plot)}   |   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    ax_info.text(0.5, 0.5, info_txt, transform=ax_info.transAxes, ha="center", va="center",
+                color="#aaaaaa", fontsize=9, family="monospace")
 
     fig.autofmt_xdate(rotation=30)
     try:
@@ -260,14 +173,13 @@ def plot_chart(
         pass
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=140, facecolor=fig.get_facecolor(),
-                edgecolor="none", bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=140, facecolor=fig.get_facecolor(), edgecolor="none", bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
 
 
-def send_telegram_photo(image_bytes: bytes, caption: str = "") -> None:
+def send_telegram_photo(image_bytes, caption=""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     files = {"photo": ("garch_chart.png", image_bytes, "image/png")}
     data = {"chat_id": CHAT_ID, "caption": caption}
@@ -278,13 +190,11 @@ def send_telegram_photo(image_bytes: bytes, caption: str = "") -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Binance Rolling GARCH chart → Telegram")
-    parser.add_argument("--symbol", default=DEFAULT_SYMBOL, help="Binance symbol e.g. BTCUSDT")
-    parser.add_argument("--timeframe", default=DEFAULT_TIMEFRAME, help="Candle interval e.g. 1m, 5m, 15m, 1h")
-    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK, help="Number of candles to fetch")
-    parser.add_argument("--garch-lookback", type=int, default=DEFAULT_GARCH_LOOKBACK,
-                        help="Rolling window size (first N candles used, then slides) default 16")
-    parser.add_argument("--multiplier", type=float, default=DEFAULT_MULTIPLIER,
-                        help="Band multiplier (price ± mult * σ * price)")
+    parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
+    parser.add_argument("--timeframe", default=DEFAULT_TIMEFRAME)
+    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK)
+    parser.add_argument("--garch-window", type=int, default=DEFAULT_GARCH_WINDOW)
+    parser.add_argument("--multiplier", type=float, default=DEFAULT_MULTIPLIER)
     args = parser.parse_args()
 
     print(f"Fetching {args.symbol} {args.timeframe} last {args.lookback} candles ...")
@@ -293,26 +203,19 @@ def main():
 
     returns = np.log(df["close"]).diff().dropna()
 
-    print(f"Running rolling GARCH(1,1) with window = {args.garch_lookback} ...")
+    print(f"Running rolling GARCH(1,1) window={args.garch_window} ...")
     cond_vol, omega_s, alpha_s, beta_s, last_omega, last_alpha, last_beta = rolling_garch11(
-        returns, window=args.garch_lookback
+        returns, window=args.garch_window
     )
     print(f"Latest → ω={last_omega:.6e}  α={last_alpha:.4f}  β={last_beta:.4f}")
 
     print("Rendering chart ...")
-    img = plot_chart(
-        df, cond_vol, omega_s,
-        last_omega, last_alpha, last_beta,
-        multiplier=args.multiplier,
-        symbol=args.symbol,
-        timeframe=args.timeframe,
-        window=args.garch_lookback,
-    )
+    img = plot_chart(df, cond_vol, omega_s, last_omega, last_alpha, last_beta,
+                     multiplier=args.multiplier, symbol=args.symbol,
+                     timeframe=args.timeframe, window=args.garch_window)
 
-    caption = (
-        f"{args.symbol} {args.timeframe} | Rolling GARCH(1,1) window={args.garch_lookback} ×{args.multiplier}\n"
-        f"ω={last_omega:.4e}  α={last_alpha:.3f}  β={last_beta:.3f}"
-    )
+    caption = (f"{args.symbol} {args.timeframe} | Rolling GARCH(1,1) window={args.garch_window} ×{args.multiplier}\n"
+              f"ω={last_omega:.4e}  α={last_alpha:.3f}  β={last_beta:.3f}")
     print("Sending to Telegram ...")
     send_telegram_photo(img, caption=caption)
     print("Done.")
