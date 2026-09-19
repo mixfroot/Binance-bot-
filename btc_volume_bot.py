@@ -13,18 +13,17 @@ import websockets
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6263967739")
 
-SYMBOL = "btcusdt"          # lowercase, no .p
+SYMBOL = "btcusdt"
 INTERVAL = "15m"
 INTERVAL_MS = 15 * 60 * 1000
 
-RECONNECT_DELAY = 8         # seconds (as you requested)
-HEARTBEAT_SECONDS = 360     # 6 minutes
+RECONNECT_DELAY = 8
+HEARTBEAT_SECONDS = 360
 VERIFY_CANDLES = 3
 
 WICK_SHARE_THRESHOLD = 0.50
 WICK_RATIO_THRESHOLD = 0.50
 
-# Small delay between paginated REST calls (protects rate limit even for 1 symbol)
 REST_PAGE_DELAY = 0.15
 
 STREAM_URL = f"wss://fstream.binance.com/market/stream?streams={SYMBOL}@kline_{INTERVAL}"
@@ -54,7 +53,7 @@ async def send_telegram(text: str):
     await asyncio.to_thread(_send_telegram_sync, text)
 
 
-# ==================== REGION / RATIO MATH (unchanged from your logic) ====================
+# ==================== REGION / RATIO MATH ====================
 def bucket_trades_by_region(trades, open_p, close_p, high_p, low_p):
     body_top = max(open_p, close_p)
     body_bottom = min(open_p, close_p)
@@ -90,8 +89,12 @@ def region_ratio(region: dict) -> float:
 
 
 def evaluate_absorption(trades, open_p, close_p, high_p, low_p):
+    """
+    Returns: (is_absorption, direction, reason)
+    reason is a short human-readable string explaining which rule fired.
+    """
     if close_p == open_p:
-        return False, None
+        return False, None, None
 
     candle_positive = close_p > open_p
     candle_negative = close_p < open_p
@@ -111,27 +114,57 @@ def evaluate_absorption(trades, open_p, close_p, high_p, low_p):
     upper_ratio = region_ratio(regions["upper_wick"])
     lower_ratio = region_ratio(regions["lower_wick"])
 
-    buy_absorption = (
-        (delta > 0 and candle_positive and buy_share("upper_wick") >= WICK_SHARE_THRESHOLD)
-        or (delta > 0 and candle_negative and (
-            buy_share("upper_wick") >= WICK_SHARE_THRESHOLD or buy_share("body") >= WICK_SHARE_THRESHOLD
-        ))
-        or (delta < 0 and candle_negative and upper_ratio >= WICK_RATIO_THRESHOLD)
-    )
+    # ---------- BUY ABSORPTION rules ----------
+    if delta > 0 and candle_positive and buy_share("upper_wick") >= WICK_SHARE_THRESHOLD:
+        return True, "BUY", (
+            f"Green candle + positive delta + "
+            f"{buy_share('upper_wick')*100:.0f}% of all buy volume in upper wick"
+        )
 
-    sell_absorption = (
-        (delta < 0 and candle_negative and sell_share("lower_wick") >= WICK_SHARE_THRESHOLD)
-        or (delta < 0 and candle_positive and (
-            sell_share("lower_wick") >= WICK_SHARE_THRESHOLD or sell_share("body") >= WICK_SHARE_THRESHOLD
-        ))
-        or (delta > 0 and candle_positive and lower_ratio <= -WICK_RATIO_THRESHOLD)
-    )
+    if delta > 0 and candle_negative and buy_share("upper_wick") >= WICK_SHARE_THRESHOLD:
+        return True, "BUY", (
+            f"Red candle + positive delta + "
+            f"{buy_share('upper_wick')*100:.0f}% of all buy volume in upper wick"
+        )
 
-    if buy_absorption:
-        return True, "BUY"
-    if sell_absorption:
-        return True, "SELL"
-    return False, None
+    if delta > 0 and candle_negative and buy_share("body") >= WICK_SHARE_THRESHOLD:
+        return True, "BUY", (
+            f"Red candle + positive delta + "
+            f"{buy_share('body')*100:.0f}% of all buy volume in body"
+        )
+
+    if delta < 0 and candle_negative and upper_ratio >= WICK_RATIO_THRESHOLD:
+        return True, "BUY", (
+            f"Red candle + negative delta + "
+            f"upper wick ratio {upper_ratio:+.2f} (heavy buying in upper wick)"
+        )
+
+    # ---------- SELL / SHORT ABSORPTION rules ----------
+    if delta < 0 and candle_negative and sell_share("lower_wick") >= WICK_SHARE_THRESHOLD:
+        return True, "SELL", (
+            f"Red candle + negative delta + "
+            f"{sell_share('lower_wick')*100:.0f}% of all sell volume in lower wick"
+        )
+
+    if delta < 0 and candle_positive and sell_share("lower_wick") >= WICK_SHARE_THRESHOLD:
+        return True, "SELL", (
+            f"Green candle + negative delta + "
+            f"{sell_share('lower_wick')*100:.0f}% of all sell volume in lower wick"
+        )
+
+    if delta < 0 and candle_positive and sell_share("body") >= WICK_SHARE_THRESHOLD:
+        return True, "SELL", (
+            f"Green candle + negative delta + "
+            f"{sell_share('body')*100:.0f}% of all sell volume in body"
+        )
+
+    if delta > 0 and candle_positive and lower_ratio <= -WICK_RATIO_THRESHOLD:
+        return True, "SELL", (
+            f"Green candle + positive delta + "
+            f"lower wick ratio {lower_ratio:+.2f} (heavy selling in lower wick)"
+        )
+
+    return False, None, None
 
 
 def absorption_label(direction: str) -> str:
@@ -140,13 +173,9 @@ def absorption_label(direction: str) -> str:
 
 # ==================== FETCH ALL TRADES FOR ONE CANDLE ====================
 def fetch_agg_trades_sync(open_time: int, close_time: int) -> list:
-    """
-    Pulls every aggTrade that belongs to [open_time, close_time].
-    Paginates with fromId when needed. Returns list of (price, qty, is_buyer_maker).
-    """
     trades = []
     from_id = None
-    max_pages = 40          # safety: 40 * 1000 = 40k trades is more than enough for 15m
+    max_pages = 40
 
     for _ in range(max_pages):
         params = {
@@ -156,7 +185,6 @@ def fetch_agg_trades_sync(open_time: int, close_time: int) -> list:
             "limit": 1000,
         }
         if from_id is not None:
-            # When using fromId we drop startTime/endTime (Binance prefers one or the other)
             params = {
                 "symbol": SYMBOL.upper(),
                 "fromId": from_id,
@@ -172,12 +200,11 @@ def fetch_agg_trades_sync(open_time: int, close_time: int) -> list:
             break
 
         for t in batch:
-            # Only keep trades that actually fall inside this candle
             t_time = int(t["T"])
             if t_time < open_time:
                 continue
             if t_time > close_time:
-                return trades          # past the candle, done
+                return trades
 
             price = float(t["p"])
             qty = float(t["q"])
@@ -187,7 +214,6 @@ def fetch_agg_trades_sync(open_time: int, close_time: int) -> list:
         if len(batch) < 1000:
             break
 
-        # Next page starts after the last trade id we received
         from_id = int(batch[-1]["a"]) + 1
         time.sleep(REST_PAGE_DELAY)
 
@@ -203,7 +229,7 @@ async def process_closed_candle(k: dict):
     global verify_remaining
 
     open_time = int(k["t"])
-    close_time = open_time + INTERVAL_MS - 1   # inclusive end
+    close_time = open_time + INTERVAL_MS - 1
 
     open_price = float(k["o"])
     close_price = float(k["c"])
@@ -214,16 +240,19 @@ async def process_closed_candle(k: dict):
         trades = await fetch_agg_trades(open_time, close_time)
         log.info(f"Fetched {len(trades)} trades for candle open={open_time}")
 
-        is_absorption, direction = evaluate_absorption(
+        is_absorption, direction, reason = evaluate_absorption(
             trades, open_price, close_price, high_price, low_price
         )
 
         if is_absorption:
-            await send_telegram(f"{SYMBOL.upper()} — {absorption_label(direction)}")
+            msg = (
+                f"{SYMBOL.upper()} — {absorption_label(direction)}\n"
+                f"Reason: {reason}"
+            )
+            await send_telegram(msg)
         else:
             log.info(f"Candle closed. No absorption. O:{open_price} C:{close_price}")
 
-        # Verification candles after (re)connect
         if verify_remaining > 0:
             if close_price == open_price:
                 await send_telegram(
@@ -262,7 +291,7 @@ async def process_message(raw: str):
         if not k:
             return
 
-        if k.get("x"):  # candle closed
+        if k.get("x"):
             asyncio.create_task(process_closed_candle(k))
 
     except Exception:
