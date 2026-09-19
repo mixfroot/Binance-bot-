@@ -1,223 +1,312 @@
-#!/usr/bin/env python3
-import argparse
-import io
-import warnings
-from datetime import datetime, timezone
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import matplotlib.colors as mcolors
-import numpy as np
+import os
+import asyncio
+import aiohttp
 import pandas as pd
-import requests
-from matplotlib.patches import Rectangle
+import json
+import warnings
+import socket
+from datetime import datetime, timedelta
+from collections import deque
 
 warnings.filterwarnings("ignore")
 
+# === CONFIG ===
+selected_tf = "1m"
+warmup_candles = 200
+rsi_period = 14
+
+# Filters
+min_move_pct_15m = 1.0
+min_quote_volume_24h = 50_000_000
+
+# Hard cap for Railway free plan
+MAX_TRACKED = 16
+
+# RSI thresholds
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
+
+# Binance
+binance_rest_url = "https://fapi.binance.com/fapi/v1/klines"
+binance_24h_url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+binance_ws_base = "wss://fstream.binance.com/stream"
+
+# Telegram
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
 
-DEFAULT_SYMBOL = "BTCUSDT"
-DEFAULT_TIMEFRAME = "1m"
-DEFAULT_LOOKBACK = 1000         # candles fetched
-DEFAULT_DRIFT_LOOKBACK = 89    # N in close[i]-close[i-N]
-DEFAULT_SS_PERIOD = 6
+def telegram_url():
+    return f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-COLOR_GREEN = "#00e676"
-COLOR_RED = "#ff1744"
-ALPHA_BRIGHT = 0.95
-ALPHA_DIM = 0.35
+# === GLOBAL STATE ===
+df_map = {}                 # symbol -> DataFrame
+stream_tasks = {}           # symbol -> task
+tracking_symbols = set()
+fail_count = {}
+message_queue = deque()
 
+# === TELEGRAM ===
+async def _try_send_telegram(msg, session, retries=3):
+    if not BOT_TOKEN or not CHAT_ID:
+        print(f"[TEL] {msg}")
+        return True
+    for attempt in range(retries):
+        try:
+            async with session.post(
+                telegram_url(),
+                json={"chat_id": CHAT_ID, "text": msg},
+                timeout=30
+            ) as resp:
+                if resp.status == 200:
+                    return True
+                txt = await resp.text()
+                print(f"Telegram error {resp.status}: {txt}")
+        except Exception as e:
+            print(f"❌ Telegram failed: {type(e).__name__}: {e}")
+        await asyncio.sleep(2 ** attempt)
+    return False
 
-def fetch_binance_klines(symbol, interval, limit):
-    urls = [
-        "https://data-api.binance.vision/api/v3/klines",
-        "https://api.binance.com/api/v3/klines",
-        "https://api1.binance.com/api/v3/klines",
-    ]
-    all_rows = []
-    end_time = None
-    remaining = limit
-    while remaining > 0:
-        batch = min(remaining, 1000)
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": batch}
-        if end_time is not None:
-            params["endTime"] = end_time
-        data, last_err = None, None
-        for url in urls:
+async def telegram_worker():
+    connector = aiohttp.TCPConnector(family=socket.AF_INET)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        while True:
             try:
-                r = requests.get(url, params=params, timeout=30)
-                r.raise_for_status()
-                data = r.json()
-                break
+                if message_queue:
+                    msg = message_queue.popleft()
+                    await _try_send_telegram(msg, session)
+                    await asyncio.sleep(1.1)
+                else:
+                    await asyncio.sleep(0.15)
             except Exception as e:
-                last_err = e
-        if not data:
-            if not all_rows:
-                raise RuntimeError(f"All Binance endpoints failed: {last_err}")
-            break
-        all_rows = data + all_rows
-        remaining -= len(data)
-        end_time = data[0][0] - 1
-        if len(data) < batch:
-            break
+                print(f"[TEL worker] {e}")
+                await asyncio.sleep(1)
 
-    df = pd.DataFrame(all_rows, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore",
+def send_telegram(msg):
+    message_queue.append(msg)
+
+# === HELPERS ===
+async def fetch_candles(session, symbol, interval, limit):
+    url = f"{binance_rest_url}?symbol={symbol}&interval={interval}&limit={limit}"
+    async with session.get(url) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+def build_ohlc_df(raw):
+    if not raw:
+        return pd.DataFrame()
+    df = pd.DataFrame(raw, columns=[
+        "open_time", "open", "high", "low", "close",
+        "volume", "close_time", "quote_volume", "trades",
+        "taker_base_vol", "taker_quote_vol", "ignore"
     ])
-    df = df.drop_duplicates(subset="open_time").sort_values("open_time")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-    df = df.set_index("open_time")
-    return df[["open", "high", "low", "close", "volume"]].tail(limit)
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    return df.set_index("close_time")[["open", "high", "low", "close"]]
 
+# === DITCH COIN ===
+async def ditch_symbol(symbol, reason=""):
+    if symbol in stream_tasks:
+        task = stream_tasks.pop(symbol, None)
+        if task and not task.done():
+            task.cancel()
+    df_map.pop(symbol, None)
+    tracking_symbols.discard(symbol)
+    print(f"[Ditch] {symbol} removed. Reason: {reason}. Now tracking {len(tracking_symbols)}")
 
-def super_smoother(series: pd.Series, period: int = 6) -> pd.Series:
-    """Ehlers 2-pole SuperSmoother filter."""
-    a1 = np.exp(-1.414 * np.pi / period)
-    b1 = 2 * a1 * np.cos(1.414 * np.pi / period)
-    c2 = b1
-    c3 = -a1 * a1
-    c1 = 1 - c2 - c3
+# === RSI CHECK + IMMEDIATE DITCH ===
+async def check_rsi_and_alert(symbol, rsi_value):
+    if rsi_value > RSI_OVERBOUGHT or rsi_value < RSI_OVERSOLD:
+        side = "Overbought" if rsi_value > RSI_OVERBOUGHT else "Oversold"
+        msg = f"⚠️ {symbol} {side} — RSI: {rsi_value:.2f}"
+        print(msg)
+        send_telegram(msg)
+        await ditch_symbol(symbol, reason=f"RSI {side}")
 
-    x = series.values
-    n = len(x)
-    filt = np.zeros(n)
-    for i in range(n):
-        if i < 2:
-            filt[i] = x[i]
-        else:
-            filt[i] = c1 * (x[i] + x[i - 1]) / 2.0 + c2 * filt[i - 1] + c3 * filt[i - 2]
-    return pd.Series(filt, index=series.index)
-
-
-def compute_drift_histogram(df: pd.DataFrame, drift_lookback: int = 1, ss_period: int = 6):
-    """
-    drift  = close[i] - close[i-drift_lookback]   (span-N raw move, NaN for first N bars)
-    smooth = SuperSmoother(drift, ss_period)       (Ehlers 2-pole, denoised)
-    bar colors: green if smooth>=0 else red
-    dimming: DIM if |smooth[i]| < |smooth[i-1]| (shrinking), else BRIGHT
-    """
-    drift = df["close"].diff(periods=drift_lookback).fillna(0.0)
-    smooth = super_smoother(drift, period=ss_period)
-
-    vals = smooth.values
-    n = len(vals)
-    face_colors = []
-    for i in range(n):
-        base = COLOR_GREEN if vals[i] >= 0 else COLOR_RED
-        if i == 0:
-            a = ALPHA_BRIGHT
-        else:
-            growing = abs(vals[i]) >= abs(vals[i - 1])
-            a = ALPHA_BRIGHT if growing else ALPHA_DIM
-        face_colors.append(mcolors.to_rgba(base, alpha=a))
-
-    return drift, smooth, face_colors
-
-
-def plot_chart(df, smooth, face_colors, symbol, timeframe, drift_lookback, ss_period):
-    fig = plt.figure(figsize=(14, 9), facecolor="#000000")
-    gs = fig.add_gridspec(3, 1, height_ratios=[3.0, 1.1, 0.18], hspace=0.10)
-    ax_price = fig.add_subplot(gs[0])
-    ax_hist = fig.add_subplot(gs[1], sharex=ax_price)
-    ax_info = fig.add_subplot(gs[2])
-
-    for ax in (ax_price, ax_hist, ax_info):
-        ax.set_facecolor("#000000")
-        ax.tick_params(colors="#cccccc", labelsize=8)
-        for spine in ax.spines.values():
-            spine.set_color("#333333")
-
-    # ---- Candlesticks ----
-    width = 0.6 * (df.index[1] - df.index[0]).total_seconds() / 86400.0 if len(df) > 1 else 0.0005
-    for ts, row in df.iterrows():
-        o, h, l, c = row["open"], row["high"], row["low"], row["close"]
-        color = "#00e676" if c >= o else "#ff1744"
-        ax_price.plot([ts, ts], [l, h], color=color, linewidth=0.9, solid_capstyle="round")
-        body_low = min(o, c)
-        body_h = abs(c - o) or ((h - l) * 0.02 or 1e-8)
-        rect = Rectangle((mdates.date2num(ts) - width / 2, body_low), width, body_h,
-                         facecolor=color, edgecolor=color, linewidth=0.5, alpha=0.95)
-        ax_price.add_patch(rect)
-
-    ax_price.set_ylabel("Price", color="#cccccc")
-    ax_price.set_title(
-        f"{symbol}  |  {timeframe}  |  Drift(N={drift_lookback}) SuperSmoother({ss_period}) Histogram",
-        color="#ffffff", fontsize=12, pad=8,
-    )
-    ax_price.grid(True, color="#222222", linestyle="--", linewidth=0.5)
-    ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=timezone.utc))
-
-    # ---- Drift histogram panel ----
-    ax_hist.bar(smooth.index, smooth.values, width=width, color=face_colors, align="center")
-    ax_hist.axhline(0, color="#555555", linewidth=0.8)
-    ax_hist.set_ylabel(f"Drift(N={drift_lookback})\nSS({ss_period})", color="#cccccc")
-    ax_hist.grid(True, color="#222222", linestyle="--", linewidth=0.5)
-
-    ax_info.axis("off")
-    latest = smooth.iloc[-1]
-    info_txt = (f"Latest drift(N={drift_lookback}) SS({ss_period}) = {latest:+.4f}   |   "
-                f"candles = {len(df)}   |   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    ax_info.text(0.5, 0.5, info_txt, transform=ax_info.transAxes, ha="center", va="center",
-                color="#aaaaaa", fontsize=9, family="monospace")
-
-    fig.autofmt_xdate(rotation=30)
+# === GET NEW CANDIDATES (15m movers) ===
+async def get_new_movers(session):
     try:
-        plt.tight_layout()
-    except Exception:
-        pass
+        async with session.get(binance_24h_url) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except Exception as e:
+        send_telegram(f"Volume fetch error: {e}")
+        return []
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=140, facecolor=fig.get_facecolor(), edgecolor="none", bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
+    # Volume filter first
+    candidates = [
+        item["symbol"]
+        for item in data
+        if item.get("symbol", "").endswith("USDT")
+        and float(item.get("quoteVolume", 0)) >= min_quote_volume_24h
+        and not any(c.isdigit() for c in item["symbol"].replace("USDT", ""))
+    ]
 
+    if not candidates:
+        return []
 
-def send_telegram_photo(image_bytes, caption=""):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("drift_ss_chart.png", image_bytes, "image/png")}
-    data = {"chat_id": CHAT_ID, "caption": caption}
-    r = requests.post(url, data=data, files=files, timeout=60)
-    r.raise_for_status()
-    print("Telegram send status:", r.status_code, r.json().get("ok"))
+    sem = asyncio.Semaphore(8)
 
+    async def check_one(sym):
+        async with sem:
+            try:
+                raw = await fetch_candles(session, sym, "15m", 3)
+                if not raw or len(raw) < 2:
+                    return None
+                # Take the last closed candle (second last)
+                k = raw[-2]
+                o = float(k[1])
+                c = float(k[4])
+                if o <= 0:
+                    return None
+                move = abs((c - o) / o) * 100
+                if move >= min_move_pct_15m:
+                    return sym
+            except Exception:
+                return None
+            return None
 
-def main():
-    parser = argparse.ArgumentParser(description="Binance drift SuperSmoother histogram -> Telegram")
-    parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
-    parser.add_argument("--timeframe", default=DEFAULT_TIMEFRAME)
-    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK, help="candles fetched")
-    parser.add_argument("--drift-lookback", type=int, default=DEFAULT_DRIFT_LOOKBACK,
-                        help="N in close[i]-close[i-N]")
-    parser.add_argument("--ss-period", type=int, default=DEFAULT_SS_PERIOD, help="Ehlers SuperSmoother period")
-    args = parser.parse_args()
+    tasks = [asyncio.create_task(check_one(s)) for s in candidates]
+    results = await asyncio.gather(*tasks)
+    movers = [r for r in results if r]
+    print(f"[Filter] New 15m movers found: {len(movers)}")
+    return movers
 
-    print(f"Fetching {args.symbol} {args.timeframe} last {args.lookback} candles ...")
-    df = fetch_binance_klines(args.symbol, args.timeframe, args.lookback)
-    print(f"Got {len(df)} candles from {df.index[0]} to {df.index[-1]}")
+# === BOOTSTRAP + START STREAM ===
+async def bootstrap_and_start(session, symbol):
+    if symbol in tracking_symbols or len(tracking_symbols) >= MAX_TRACKED:
+        return
 
-    drift, smooth, face_colors = compute_drift_histogram(
-        df, drift_lookback=args.drift_lookback, ss_period=args.ss_period
-    )
-    print(f"Latest drift(N={args.drift_lookback}) SS({args.ss_period}) = {smooth.iloc[-1]:+.4f}")
+    try:
+        raw = await fetch_candles(session, symbol, selected_tf, warmup_candles)
+        df = build_ohlc_df(raw)
+        if df.empty or len(df) < rsi_period + 5:
+            return
 
-    print("Rendering chart ...")
-    img = plot_chart(df, smooth, face_colors, args.symbol, args.timeframe,
-                     args.drift_lookback, args.ss_period)
+        df_map[symbol] = df
+        tracking_symbols.add(symbol)
+        stream_tasks[symbol] = asyncio.create_task(process_stream(symbol, session))
+        print(f"[Track] Added {symbol}. Tracking: {len(tracking_symbols)}/{MAX_TRACKED}")
+    except Exception as e:
+        print(f"[Bootstrap] {symbol} failed: {e}")
 
-    caption = (f"{args.symbol} {args.timeframe} | Drift(N={args.drift_lookback}) "
-              f"SuperSmoother({args.ss_period}) Histogram\nlatest={smooth.iloc[-1]:+.4f}")
-    print("Sending to Telegram ...")
-    send_telegram_photo(img, caption=caption)
-    print("Done.")
+# === WEBSOCKET HANDLER ===
+async def process_stream(symbol, session):
+    for attempt in range(2):
+        try:
+            stream = f"{symbol.lower()}@kline_{selected_tf}"
+            url = f"{binance_ws_base}?streams={stream}"
+            print(f"[WS] Connecting {symbol}")
+            async with session.ws_connect(url, autoping=True, heartbeat=30) as ws:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        k = data.get("data", {}).get("k", {})
+                        if not k or not k.get("x"):
+                            continue
 
+                        close_time = pd.to_datetime(k["T"], unit="ms", utc=True)
+                        row = pd.DataFrame(
+                            [[float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"])]],
+                            index=[close_time],
+                            columns=["open", "high", "low", "close"]
+                        )
+
+                        df = df_map.get(symbol)
+                        if df is None:
+                            return
+
+                        if close_time in df.index:
+                            df = df.drop(close_time)
+                        df = pd.concat([df, row]).iloc[-warmup_candles:]
+                        df_map[symbol] = df
+
+                        if len(df) < rsi_period + 1:
+                            continue
+
+                        # Same RSI calculation as your original code
+                        delta = df["close"].diff()
+                        gain = delta.clip(lower=0)
+                        loss = -delta.clip(upper=0)
+                        avg_gain = gain.ewm(alpha=1/rsi_period, adjust=False, min_periods=rsi_period).mean()
+                        avg_loss = loss.ewm(alpha=1/rsi_period, adjust=False, min_periods=rsi_period).mean()
+                        rs = avg_gain / avg_loss
+                        rsi = 100 - (100 / (1 + rs))
+                        await check_rsi_and_alert(symbol, rsi.iloc[-1])
+
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        raise RuntimeError("WebSocket error")
+
+        except asyncio.CancelledError:
+            print(f"[WS] {symbol} cancelled")
+            return
+        except Exception as e:
+            print(f"[WS] {symbol} error: {type(e).__name__}: {e}")
+            if attempt < 1:
+                await asyncio.sleep(3)
+                continue
+            fail_count[symbol] = fail_count.get(symbol, 0) + 1
+            await ditch_symbol(symbol, reason="WS failed")
+            return
+
+# === 15-MINUTE MAINTENANCE ===
+async def maintenance_loop(session):
+    while True:
+        await asyncio.sleep(900)  # 15 minutes
+        try:
+            print("[Maint] Running 15m scan...")
+            movers = await get_new_movers(session)
+
+            # Add new ones only if we have free slots
+            free_slots = MAX_TRACKED - len(tracking_symbols)
+            if free_slots > 0 and movers:
+                to_add = [s for s in movers if s not in tracking_symbols][:free_slots]
+                for sym in to_add:
+                    await bootstrap_and_start(session, sym)
+
+            # Clean dead tasks
+            for sym, task in list(stream_tasks.items()):
+                if task.done():
+                    await ditch_symbol(sym, reason="task died")
+
+            print(f"[Maint] Tracking {len(tracking_symbols)}/{MAX_TRACKED}")
+        except Exception as e:
+            print(f"[Maint] Error: {e}")
+            send_telegram(f"Maintenance error: {e}")
+
+# === MAIN ===
+async def main():
+    asyncio.create_task(telegram_worker())
+
+    async with aiohttp.ClientSession() as session:
+        start_msg = (
+            f"🚀 RSI Mover Bot started\n"
+            f"TF: {selected_tf} | OB>{RSI_OVERBOUGHT} / OS<{RSI_OVERSOLD}\n"
+            f"Only tracks coins with ≥{min_move_pct_15m}% 15m move + ≥${min_quote_volume_24h//1_000_000}M vol\n"
+            f"Max {MAX_TRACKED} coins | Ditch after alert"
+        )
+        print(start_msg)
+        send_telegram(start_msg)
+
+        # Initial fill
+        movers = await get_new_movers(session)
+        for sym in movers[:MAX_TRACKED]:
+            await bootstrap_and_start(session, sym)
+
+        asyncio.create_task(maintenance_loop(session))
+
+        while True:
+            await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            print("Stopped by user")
+            break
+        except Exception as e:
+            print(f"Bot crashed: {e} — restarting in 5s")
+            try:
+                asyncio.run(asyncio.sleep(5))
+            except Exception:
+                pass
