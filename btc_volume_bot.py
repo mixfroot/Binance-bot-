@@ -1,225 +1,316 @@
-#!/usr/bin/env python3
-import argparse
-import io
-import warnings
+import asyncio
+import json
+import logging
+import os
+import time
+import traceback
 from datetime import datetime, timezone
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import numpy as np
-import pandas as pd
 import requests
-from arch import arch_model
-from matplotlib.patches import Rectangle
+import websockets
 
-warnings.filterwarnings("ignore")
+# ==================== CONFIG ====================
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6263967739")
 
-BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
-CHAT_ID = "6263967739"
+SYMBOL = "btcusdt"          # lowercase, no .p
+INTERVAL = "15m"
+INTERVAL_MS = 15 * 60 * 1000
 
-DEFAULT_SYMBOL = "BTCUSDT"
-DEFAULT_TIMEFRAME = "1m"
-DEFAULT_LOOKBACK = 2000
-DEFAULT_GARCH_WINDOW = 233
-DEFAULT_MULTIPLIER = 1.618
+RECONNECT_DELAY = 8         # seconds (as you requested)
+HEARTBEAT_SECONDS = 360     # 6 minutes
+VERIFY_CANDLES = 3
 
+WICK_SHARE_THRESHOLD = 0.50
+WICK_RATIO_THRESHOLD = 0.50
 
-def fetch_binance_klines(symbol, interval, limit):
-    urls = [
-        "https://data-api.binance.vision/api/v3/klines",
-        "https://api.binance.com/api/v3/klines",
-        "https://api1.binance.com/api/v3/klines",
-    ]
-    all_rows = []
-    end_time = None
-    remaining = limit
-    while remaining > 0:
-        batch = min(remaining, 1000)
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": batch}
-        if end_time is not None:
-            params["endTime"] = end_time
-        data, last_err = None, None
-        for url in urls:
-            try:
-                r = requests.get(url, params=params, timeout=30)
-                r.raise_for_status()
-                data = r.json()
-                break
-            except Exception as e:
-                last_err = e
-        if not data:
-            if not all_rows:
-                raise RuntimeError(f"All Binance endpoints failed: {last_err}")
-            break
-        all_rows = data + all_rows
-        remaining -= len(data)
-        end_time = data[0][0] - 1
-        if len(data) < batch:
-            break
+# Small delay between paginated REST calls (protects rate limit even for 1 symbol)
+REST_PAGE_DELAY = 0.15
 
-    df = pd.DataFrame(all_rows, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore",
-    ])
-    df = df.drop_duplicates(subset="open_time").sort_values("open_time")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-    df = df.set_index("open_time")
-    return df[["open", "high", "low", "close", "volume"]].tail(limit)
+STREAM_URL = f"wss://fstream.binance.com/market/stream?streams={SYMBOL}@kline_{INTERVAL}"
+REST_BASE = "https://fapi.binance.com"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("absorption-bot")
+
+verify_remaining = 0
 
 
-def rolling_garch11(returns, window=150):
-    rets = returns.dropna() * 100.0
-    n = len(rets)
-    if n < window:
-        raise ValueError(f"Need at least {window} returns, got {n}")
-
-    vol = np.full(n, np.nan)
-    omega_arr = np.full(n, np.nan)
-    alpha_arr = np.full(n, np.nan)
-    beta_arr = np.full(n, np.nan)
-    last_omega = last_alpha = last_beta = np.nan
-
-    for i in range(window - 1, n):
-        window_rets = rets.iloc[i - window + 1: i + 1]
-        try:
-            model = arch_model(window_rets, vol="Garch", p=1, q=1, mean="Zero", rescale=False)
-            res = model.fit(disp="off", show_warning=False, options={"maxiter": 300})
-            last_omega = float(res.params["omega"])
-            last_alpha = float(res.params["alpha[1]"])
-            last_beta = float(res.params["beta[1]"])
-            vol[i] = float(res.conditional_volatility.iloc[-1]) / 100.0
-        except Exception:
-            if i > 0 and not np.isnan(vol[i - 1]):
-                vol[i] = vol[i - 1]
-        omega_arr[i], alpha_arr[i], beta_arr[i] = last_omega, last_alpha, last_beta
-
-    idx = rets.index
-    return (pd.Series(vol, index=idx), pd.Series(omega_arr, index=idx),
-            pd.Series(alpha_arr, index=idx), pd.Series(beta_arr, index=idx),
-            last_omega, last_alpha, last_beta)
-
-
-def plot_chart(df, cond_vol, omega_s, last_omega, last_alpha, last_beta,
-               multiplier, symbol, timeframe, window):
-    common_idx = df.index.intersection(cond_vol.dropna().index)
-    df_plot = df.loc[common_idx]
-    vol = cond_vol.loc[common_idx]
-    omegas = omega_s.loc[common_idx]
-
-    upper = df_plot["close"] * (1.0 + multiplier * vol)
-    lower = df_plot["close"] * (1.0 - multiplier * vol)
-
-    fig = plt.figure(figsize=(14, 10), facecolor="#000000")
-    gs = fig.add_gridspec(4, 1, height_ratios=[3.0, 0.9, 0.7, 0.18], hspace=0.10)
-    ax_price = fig.add_subplot(gs[0])
-    ax_vol = fig.add_subplot(gs[1], sharex=ax_price)
-    ax_omega = fig.add_subplot(gs[2], sharex=ax_price)
-    ax_info = fig.add_subplot(gs[3])
-
-    for ax in (ax_price, ax_vol, ax_omega, ax_info):
-        ax.set_facecolor("#000000")
-        ax.tick_params(colors="#cccccc", labelsize=8)
-        for spine in ax.spines.values():
-            spine.set_color("#333333")
-
-    width = 0.6 * (df_plot.index[1] - df_plot.index[0]).total_seconds() / 86400.0 if len(df_plot) > 1 else 0.0005
-    for ts, row in df_plot.iterrows():
-        o, h, l, c = row["open"], row["high"], row["low"], row["close"]
-        color = "#00e676" if c >= o else "#ff1744"
-        ax_price.plot([ts, ts], [l, h], color=color, linewidth=0.9, solid_capstyle="round")
-        body_low = min(o, c)
-        body_h = abs(c - o) or ((h - l) * 0.02 or 1e-8)
-        rect = Rectangle((mdates.date2num(ts) - width / 2, body_low), width, body_h,
-                         facecolor=color, edgecolor=color, linewidth=0.5, alpha=0.95)
-        ax_price.add_patch(rect)
-
-    ax_price.plot(df_plot.index, upper, color="#00bcd4", linewidth=1.4, label=f"Upper ({multiplier}×σ)", alpha=0.9)
-    ax_price.plot(df_plot.index, lower, color="#ff9800", linewidth=1.4, label=f"Lower ({multiplier}×σ)", alpha=0.9)
-    ax_price.fill_between(df_plot.index, lower, upper, color="#00bcd4", alpha=0.08)
-    ax_price.set_ylabel("Price", color="#cccccc")
-    ax_price.legend(loc="upper left", fontsize=8, facecolor="#111111", edgecolor="#333333", labelcolor="#eeeeee")
-    ax_price.set_title(f"{symbol}  |  {timeframe}  |  Rolling GARCH(1,1)  window={window}  mult={multiplier}",
-                       color="#ffffff", fontsize=12, pad=8)
-    ax_price.grid(True, color="#222222", linestyle="--", linewidth=0.5)
-    ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=timezone.utc))
-
-    ax_vol.plot(vol.index, vol * 100, color="#e040fb", linewidth=1.3, label="Cond. Vol (%)")
-    ax_vol.fill_between(vol.index, 0, vol * 100, color="#e040fb", alpha=0.15)
-    ax_vol.set_ylabel("σ (%)", color="#cccccc")
-    ax_vol.legend(loc="upper left", fontsize=8, facecolor="#111111", edgecolor="#333333", labelcolor="#eeeeee")
-    ax_vol.grid(True, color="#222222", linestyle="--", linewidth=0.5)
-
-    ax_omega.plot(omegas.index, omegas, color="#ffeb3b", linewidth=1.2, label="ω (omega)")
-    ax_omega.set_ylabel("ω", color="#cccccc")
-    ax_omega.legend(loc="upper left", fontsize=8, facecolor="#111111", edgecolor="#333333", labelcolor="#eeeeee")
-    ax_omega.grid(True, color="#222222", linestyle="--", linewidth=0.5)
-
-    ax_info.axis("off")
-    info_txt = (f"Latest →  ω = {last_omega:.6e}   |   α = {last_alpha:.4f}   |   β = {last_beta:.4f}   |   "
-                f"α+β = {last_alpha + last_beta:.4f}   |   window = {window}   |   "
-                f"candles = {len(df_plot)}   |   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    ax_info.text(0.5, 0.5, info_txt, transform=ax_info.transAxes, ha="center", va="center",
-                color="#aaaaaa", fontsize=9, family="monospace")
-
-    fig.autofmt_xdate(rotation=30)
+# ==================== TELEGRAM ====================
+def _send_telegram_sync(text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        plt.tight_layout()
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
+        if r.status_code != 200:
+            log.error(f"Telegram send failed: {r.status_code} {r.text}")
     except Exception:
-        pass
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=140, facecolor=fig.get_facecolor(), edgecolor="none", bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
+        log.error(f"Telegram send exception:\n{traceback.format_exc()}")
 
 
-def send_telegram_photo(image_bytes, caption=""):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("garch_chart.png", image_bytes, "image/png")}
-    data = {"chat_id": CHAT_ID, "caption": caption}
-    r = requests.post(url, data=data, files=files, timeout=60)
-    r.raise_for_status()
-    print("Telegram send status:", r.status_code, r.json().get("ok"))
+async def send_telegram(text: str):
+    await asyncio.to_thread(_send_telegram_sync, text)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Binance Rolling GARCH chart → Telegram")
-    parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
-    parser.add_argument("--timeframe", default=DEFAULT_TIMEFRAME)
-    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK)
-    parser.add_argument("--garch-window", type=int, default=DEFAULT_GARCH_WINDOW)
-    parser.add_argument("--multiplier", type=float, default=DEFAULT_MULTIPLIER)
-    args = parser.parse_args()
+# ==================== REGION / RATIO MATH (unchanged from your logic) ====================
+def bucket_trades_by_region(trades, open_p, close_p, high_p, low_p):
+    body_top = max(open_p, close_p)
+    body_bottom = min(open_p, close_p)
 
-    print(f"Fetching {args.symbol} {args.timeframe} last {args.lookback} candles ...")
-    df = fetch_binance_klines(args.symbol, args.timeframe, args.lookback)
-    print(f"Got {len(df)} candles from {df.index[0]} to {df.index[-1]}")
+    regions = {
+        "upper_wick": {"buy": 0.0, "sell": 0.0},
+        "body": {"buy": 0.0, "sell": 0.0},
+        "lower_wick": {"buy": 0.0, "sell": 0.0},
+    }
 
-    returns = np.log(df["close"]).diff().dropna()
+    for price, qty, is_buyer_maker in trades:
+        if price > body_top:
+            region = "upper_wick"
+        elif price < body_bottom:
+            region = "lower_wick"
+        else:
+            region = "body"
 
-    print(f"Running rolling GARCH(1,1) window={args.garch_window} ...")
-    cond_vol, omega_s, alpha_s, beta_s, last_omega, last_alpha, last_beta = rolling_garch11(
-        returns, window=args.garch_window
+        if is_buyer_maker:
+            regions[region]["sell"] += qty
+        else:
+            regions[region]["buy"] += qty
+
+    return regions
+
+
+def region_ratio(region: dict) -> float:
+    b, s = region["buy"], region["sell"]
+    total = b + s
+    if total == 0:
+        return 0.0
+    return (b - s) / total
+
+
+def evaluate_absorption(trades, open_p, close_p, high_p, low_p):
+    if close_p == open_p:
+        return False, None
+
+    candle_positive = close_p > open_p
+    candle_negative = close_p < open_p
+
+    regions = bucket_trades_by_region(trades, open_p, close_p, high_p, low_p)
+
+    total_buy = sum(r["buy"] for r in regions.values())
+    total_sell = sum(r["sell"] for r in regions.values())
+    delta = total_buy - total_sell
+
+    def buy_share(name):
+        return regions[name]["buy"] / total_buy if total_buy > 0 else 0.0
+
+    def sell_share(name):
+        return regions[name]["sell"] / total_sell if total_sell > 0 else 0.0
+
+    upper_ratio = region_ratio(regions["upper_wick"])
+    lower_ratio = region_ratio(regions["lower_wick"])
+
+    buy_absorption = (
+        (delta > 0 and candle_positive and buy_share("upper_wick") >= WICK_SHARE_THRESHOLD)
+        or (delta > 0 and candle_negative and (
+            buy_share("upper_wick") >= WICK_SHARE_THRESHOLD or buy_share("body") >= WICK_SHARE_THRESHOLD
+        ))
+        or (delta < 0 and candle_negative and upper_ratio >= WICK_RATIO_THRESHOLD)
     )
-    print(f"Latest → ω={last_omega:.6e}  α={last_alpha:.4f}  β={last_beta:.4f}")
 
-    print("Rendering chart ...")
-    img = plot_chart(df, cond_vol, omega_s, last_omega, last_alpha, last_beta,
-                     multiplier=args.multiplier, symbol=args.symbol,
-                     timeframe=args.timeframe, window=args.garch_window)
+    sell_absorption = (
+        (delta < 0 and candle_negative and sell_share("lower_wick") >= WICK_SHARE_THRESHOLD)
+        or (delta < 0 and candle_positive and (
+            sell_share("lower_wick") >= WICK_SHARE_THRESHOLD or sell_share("body") >= WICK_SHARE_THRESHOLD
+        ))
+        or (delta > 0 and candle_positive and lower_ratio <= -WICK_RATIO_THRESHOLD)
+    )
 
-    caption = (f"{args.symbol} {args.timeframe} | Rolling GARCH(1,1) window={args.garch_window} ×{args.multiplier}\n"
-              f"ω={last_omega:.4e}  α={last_alpha:.3f}  β={last_beta:.3f}")
-    print("Sending to Telegram ...")
-    send_telegram_photo(img, caption=caption)
-    print("Done.")
+    if buy_absorption:
+        return True, "BUY"
+    if sell_absorption:
+        return True, "SELL"
+    return False, None
+
+
+def absorption_label(direction: str) -> str:
+    return "BUY ABSORPTION" if direction == "BUY" else "SHORT ABSORPTION"
+
+
+# ==================== FETCH ALL TRADES FOR ONE CANDLE ====================
+def fetch_agg_trades_sync(open_time: int, close_time: int) -> list:
+    """
+    Pulls every aggTrade that belongs to [open_time, close_time].
+    Paginates with fromId when needed. Returns list of (price, qty, is_buyer_maker).
+    """
+    trades = []
+    from_id = None
+    max_pages = 40          # safety: 40 * 1000 = 40k trades is more than enough for 15m
+
+    for _ in range(max_pages):
+        params = {
+            "symbol": SYMBOL.upper(),
+            "startTime": open_time,
+            "endTime": close_time,
+            "limit": 1000,
+        }
+        if from_id is not None:
+            # When using fromId we drop startTime/endTime (Binance prefers one or the other)
+            params = {
+                "symbol": SYMBOL.upper(),
+                "fromId": from_id,
+                "limit": 1000,
+            }
+
+        r = requests.get(f"{REST_BASE}/fapi/v1/aggTrades", params=params, timeout=10)
+        if r.status_code != 200:
+            raise RuntimeError(f"aggTrades HTTP {r.status_code}: {r.text[:300]}")
+
+        batch = r.json()
+        if not batch:
+            break
+
+        for t in batch:
+            # Only keep trades that actually fall inside this candle
+            t_time = int(t["T"])
+            if t_time < open_time:
+                continue
+            if t_time > close_time:
+                return trades          # past the candle, done
+
+            price = float(t["p"])
+            qty = float(t["q"])
+            is_buyer_maker = t["m"]
+            trades.append((price, qty, is_buyer_maker))
+
+        if len(batch) < 1000:
+            break
+
+        # Next page starts after the last trade id we received
+        from_id = int(batch[-1]["a"]) + 1
+        time.sleep(REST_PAGE_DELAY)
+
+    return trades
+
+
+async def fetch_agg_trades(open_time: int, close_time: int) -> list:
+    return await asyncio.to_thread(fetch_agg_trades_sync, open_time, close_time)
+
+
+# ==================== CORE: PROCESS A CLOSED CANDLE ====================
+async def process_closed_candle(k: dict):
+    global verify_remaining
+
+    open_time = int(k["t"])
+    close_time = open_time + INTERVAL_MS - 1   # inclusive end
+
+    open_price = float(k["o"])
+    close_price = float(k["c"])
+    high_price = float(k["h"])
+    low_price = float(k["l"])
+
+    try:
+        trades = await fetch_agg_trades(open_time, close_time)
+        log.info(f"Fetched {len(trades)} trades for candle open={open_time}")
+
+        is_absorption, direction = evaluate_absorption(
+            trades, open_price, close_price, high_price, low_price
+        )
+
+        if is_absorption:
+            await send_telegram(f"{SYMBOL.upper()} — {absorption_label(direction)}")
+        else:
+            log.info(f"Candle closed. No absorption. O:{open_price} C:{close_price}")
+
+        # Verification candles after (re)connect
+        if verify_remaining > 0:
+            if close_price == open_price:
+                await send_telegram(
+                    f"🔍 Verification candle ({VERIFY_CANDLES - verify_remaining + 1}/{VERIFY_CANDLES})\n"
+                    f"{SYMBOL.upper()} {INTERVAL}: DOJI (O==C=={open_price}) — data is flowing."
+                )
+            elif not is_absorption:
+                direction_label = "GREEN" if close_price > open_price else "RED"
+                await send_telegram(
+                    f"🔍 Verification candle ({VERIFY_CANDLES - verify_remaining + 1}/{VERIFY_CANDLES})\n"
+                    f"{SYMBOL.upper()} {INTERVAL} closed {direction_label} — "
+                    f"no absorption, confirming data is live."
+                )
+            verify_remaining -= 1
+
+    except Exception:
+        err = traceback.format_exc()
+        log.error(err)
+        await send_telegram(f"⚠️ Error while evaluating candle close:\n{err[-500:]}")
+
+
+# ==================== HEARTBEAT ====================
+async def heartbeat_task():
+    while True:
+        await asyncio.sleep(HEARTBEAT_SECONDS)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        await send_telegram(f"❤️ Heartbeat — bot is alive ({now})")
+
+
+# ==================== WEBSOCKET LOOP ====================
+async def process_message(raw: str):
+    try:
+        msg = json.loads(raw)
+        data = msg.get("data", {})
+        k = data.get("k")
+        if not k:
+            return
+
+        if k.get("x"):  # candle closed
+            asyncio.create_task(process_closed_candle(k))
+
+    except Exception:
+        err = traceback.format_exc()
+        log.error(err)
+        await send_telegram(f"⚠️ Error processing message:\n{err[-500:]}")
+
+
+async def run_forever():
+    global verify_remaining
+
+    await send_telegram(
+        f"🚀 Bot started — watching {SYMBOL.upper()} {INTERVAL} (close-only mode).\n"
+        f"Will confirm the first {VERIFY_CANDLES} closed candles."
+    )
+    first_connect = True
+
+    while True:
+        try:
+            async with websockets.connect(STREAM_URL, ping_interval=20, ping_timeout=20) as ws:
+                if not first_connect:
+                    await send_telegram("✅ Reconnected successfully.")
+                first_connect = False
+                verify_remaining = VERIFY_CANDLES
+                log.info("Connected to Binance websocket.")
+
+                async for raw in ws:
+                    await process_message(raw)
+
+        except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
+            log.error(f"Connection lost: {e}")
+            await send_telegram(
+                f"❌ Websocket disconnected: {e}\nReconnecting in {RECONNECT_DELAY}s..."
+            )
+
+        except Exception:
+            err = traceback.format_exc()
+            log.error(err)
+            await send_telegram(
+                f"⚠️ Unexpected error:\n{err[-500:]}\nReconnecting in {RECONNECT_DELAY}s..."
+            )
+
+        await asyncio.sleep(RECONNECT_DELAY)
+
+
+async def main():
+    await asyncio.gather(run_forever(), heartbeat_task())
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
