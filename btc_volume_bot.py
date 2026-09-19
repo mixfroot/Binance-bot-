@@ -8,6 +8,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 import requests
@@ -18,10 +19,15 @@ warnings.filterwarnings("ignore")
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
 
-DEFAULT_SYMBOL = "NEARUSDT"
+DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_TIMEFRAME = "1m"
-DEFAULT_LOOKBACK = 1000      # candles fetched
-DEFAULT_WINDOW = 34         # rolling window (candles) for buy/sell ratio
+DEFAULT_LOOKBACK = 1000
+DEFAULT_SS_PERIOD = 6
+
+COLOR_GREEN = "#00e676"
+COLOR_RED = "#ff1744"
+ALPHA_BRIGHT = 0.95
+ALPHA_DIM = 0.35
 
 
 def fetch_binance_klines(symbol, interval, limit):
@@ -64,39 +70,71 @@ def fetch_binance_klines(symbol, interval, limit):
     ])
     df = df.drop_duplicates(subset="open_time").sort_values("open_time")
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    for col in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
     df = df.set_index("open_time")
-    return df[["open", "high", "low", "close", "volume", "taker_buy_base"]].tail(limit)
+    return df[["open", "high", "low", "close", "volume"]].tail(limit)
 
 
-def compute_rolling_taker_ratio(df, window=20):
+def super_smoother(series: pd.Series, period: int = 6) -> pd.Series:
     """
-    Per-candle: buy_vol = taker_buy_base, sell_vol = volume - taker_buy_base.
-    Rolling: sum buy_vol and sell_vol over the trailing `window` candles,
-    THEN compute ratio on the sums -> volume-weighted, not just averaged ratios.
-    ratio = (sum_buy - sum_sell) / (sum_buy + sum_sell)  in [-1, +1]
+    Ehlers 2-pole SuperSmoother filter.
+    a1 = exp(-1.414*pi/period)
+    b1 = 2*a1*cos(1.414*pi/period)
+    c2 = b1 ; c3 = -a1^2 ; c1 = 1 - c2 - c3
+    filt[n] = c1*(x[n]+x[n-1])/2 + c2*filt[n-1] + c3*filt[n-2]
     """
-    buy_vol = df["taker_buy_base"]
-    sell_vol = df["volume"] - df["taker_buy_base"]
+    a1 = np.exp(-1.414 * np.pi / period)
+    b1 = 2 * a1 * np.cos(1.414 * np.pi / period)
+    c2 = b1
+    c3 = -a1 * a1
+    c1 = 1 - c2 - c3
 
-    roll_buy = buy_vol.rolling(window=window, min_periods=window).sum()
-    roll_sell = sell_vol.rolling(window=window, min_periods=window).sum()
-    roll_total = roll_buy + roll_sell
+    x = series.values
+    n = len(x)
+    filt = np.zeros(n)
+    for i in range(n):
+        if i < 2:
+            filt[i] = x[i]
+        else:
+            filt[i] = c1 * (x[i] + x[i - 1]) / 2.0 + c2 * filt[i - 1] + c3 * filt[i - 2]
+    return pd.Series(filt, index=series.index)
 
-    ratio = (roll_buy - roll_sell) / roll_total.replace(0, np.nan)
-    ratio = ratio.fillna(0.0)
-    return ratio, roll_buy, roll_sell
+
+def compute_drift_histogram(df: pd.DataFrame, ss_period: int = 6):
+    """
+    drift  = close[i] - close[i-1]        (raw candle-to-candle move)
+    smooth = SuperSmoother(drift, period) (Ehlers 2-pole, denoised)
+    bar colors: green if smooth>=0 else red
+    dimming: alpha is DIM if |smooth[i]| < |smooth[i-1]|  (bar shrinking vs prior),
+             else BRIGHT (growing or flat)
+    """
+    drift = df["close"].diff().fillna(0.0)
+    smooth = super_smoother(drift, period=ss_period)
+
+    vals = smooth.values
+    n = len(vals)
+    face_colors = []
+    for i in range(n):
+        base = COLOR_GREEN if vals[i] >= 0 else COLOR_RED
+        if i == 0:
+            a = ALPHA_BRIGHT
+        else:
+            growing = abs(vals[i]) >= abs(vals[i - 1])
+            a = ALPHA_BRIGHT if growing else ALPHA_DIM
+        face_colors.append(mcolors.to_rgba(base, alpha=a))
+
+    return smooth, face_colors
 
 
-def plot_chart(df, ratio, symbol, timeframe, window):
+def plot_chart(df, smooth, face_colors, symbol, timeframe, ss_period):
     fig = plt.figure(figsize=(14, 9), facecolor="#000000")
     gs = fig.add_gridspec(3, 1, height_ratios=[3.0, 1.1, 0.18], hspace=0.10)
     ax_price = fig.add_subplot(gs[0])
-    ax_ratio = fig.add_subplot(gs[1], sharex=ax_price)
+    ax_hist = fig.add_subplot(gs[1], sharex=ax_price)
     ax_info = fig.add_subplot(gs[2])
 
-    for ax in (ax_price, ax_ratio, ax_info):
+    for ax in (ax_price, ax_hist, ax_info):
         ax.set_facecolor("#000000")
         ax.tick_params(colors="#cccccc", labelsize=8)
         for spine in ax.spines.values():
@@ -115,24 +153,20 @@ def plot_chart(df, ratio, symbol, timeframe, window):
         ax_price.add_patch(rect)
 
     ax_price.set_ylabel("Price", color="#cccccc")
-    ax_price.set_title(f"{symbol}  |  {timeframe}  |  Rolling Taker Buy/Sell Ratio (window={window})",
+    ax_price.set_title(f"{symbol}  |  {timeframe}  |  Drift SuperSmoother({ss_period}) Histogram",
                        color="#ffffff", fontsize=12, pad=8)
     ax_price.grid(True, color="#222222", linestyle="--", linewidth=0.5)
     ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=timezone.utc))
 
-    # ---- Rolling ratio panel ----
-    ratio_plot = ratio.dropna()
-    colors = np.where(ratio_plot.values >= 0, "#00e676", "#ff1744")
-    ax_ratio.bar(ratio_plot.index, ratio_plot.values, width=width, color=colors, alpha=0.6, align="center")
-    ax_ratio.plot(ratio_plot.index, ratio_plot.values, color="#00bcd4", linewidth=1.1, alpha=0.8)
-    ax_ratio.axhline(0, color="#555555", linewidth=0.8)
-    ax_ratio.set_ylim(-1.05, 1.05)
-    ax_ratio.set_ylabel(f"Buy/Sell ratio\n(roll {window})", color="#cccccc")
-    ax_ratio.grid(True, color="#222222", linestyle="--", linewidth=0.5)
+    # ---- Drift histogram panel ----
+    ax_hist.bar(smooth.index, smooth.values, width=width, color=face_colors, align="center")
+    ax_hist.axhline(0, color="#555555", linewidth=0.8)
+    ax_hist.set_ylabel(f"Drift SS({ss_period})", color="#cccccc")
+    ax_hist.grid(True, color="#222222", linestyle="--", linewidth=0.5)
 
     ax_info.axis("off")
-    latest = ratio.iloc[-1]
-    info_txt = (f"Latest rolling({window}) ratio = {latest:+.3f}   |   "
+    latest = smooth.iloc[-1]
+    info_txt = (f"Latest SS({ss_period}) drift = {latest:+.4f}   |   "
                 f"candles = {len(df)}   |   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     ax_info.text(0.5, 0.5, info_txt, transform=ax_info.transAxes, ha="center", va="center",
                 color="#aaaaaa", fontsize=9, family="monospace")
@@ -152,7 +186,7 @@ def plot_chart(df, ratio, symbol, timeframe, window):
 
 def send_telegram_photo(image_bytes, caption=""):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("taker_ratio_chart.png", image_bytes, "image/png")}
+    files = {"photo": ("drift_ss_chart.png", image_bytes, "image/png")}
     data = {"chat_id": CHAT_ID, "caption": caption}
     r = requests.post(url, data=data, files=files, timeout=60)
     r.raise_for_status()
@@ -160,25 +194,25 @@ def send_telegram_photo(image_bytes, caption=""):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Binance rolling taker buy/sell ratio -> Telegram")
+    parser = argparse.ArgumentParser(description="Binance drift SuperSmoother histogram -> Telegram")
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
     parser.add_argument("--timeframe", default=DEFAULT_TIMEFRAME)
-    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK, help="candles to fetch")
-    parser.add_argument("--window", type=int, default=DEFAULT_WINDOW, help="rolling window (candles) for ratio")
+    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK)
+    parser.add_argument("--ss-period", type=int, default=DEFAULT_SS_PERIOD, help="Ehlers SuperSmoother period")
     args = parser.parse_args()
 
     print(f"Fetching {args.symbol} {args.timeframe} last {args.lookback} candles ...")
     df = fetch_binance_klines(args.symbol, args.timeframe, args.lookback)
     print(f"Got {len(df)} candles from {df.index[0]} to {df.index[-1]}")
 
-    ratio, roll_buy, roll_sell = compute_rolling_taker_ratio(df, window=args.window)
-    print(f"Latest rolling({args.window}) ratio = {ratio.iloc[-1]:+.3f}")
+    smooth, face_colors = compute_drift_histogram(df, ss_period=args.ss_period)
+    print(f"Latest SS({args.ss_period}) drift = {smooth.iloc[-1]:+.4f}")
 
     print("Rendering chart ...")
-    img = plot_chart(df, ratio, args.symbol, args.timeframe, args.window)
+    img = plot_chart(df, smooth, face_colors, args.symbol, args.timeframe, args.ss_period)
 
-    caption = (f"{args.symbol} {args.timeframe} | Rolling Taker Buy/Sell Ratio (window={args.window})\n"
-              f"latest={ratio.iloc[-1]:+.3f}")
+    caption = (f"{args.symbol} {args.timeframe} | Drift SuperSmoother({args.ss_period}) Histogram\n"
+              f"latest={smooth.iloc[-1]:+.4f}")
     print("Sending to Telegram ...")
     send_telegram_photo(img, caption=caption)
     print("Done.")
