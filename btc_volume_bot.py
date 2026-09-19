@@ -21,7 +21,8 @@ CHAT_ID = "6263967739"
 
 DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_TIMEFRAME = "1m"
-DEFAULT_LOOKBACK = 1000
+DEFAULT_LOOKBACK = 1000         # candles fetched
+DEFAULT_DRIFT_LOOKBACK = 89    # N in close[i]-close[i-N]
 DEFAULT_SS_PERIOD = 6
 
 COLOR_GREEN = "#00e676"
@@ -77,13 +78,7 @@ def fetch_binance_klines(symbol, interval, limit):
 
 
 def super_smoother(series: pd.Series, period: int = 6) -> pd.Series:
-    """
-    Ehlers 2-pole SuperSmoother filter.
-    a1 = exp(-1.414*pi/period)
-    b1 = 2*a1*cos(1.414*pi/period)
-    c2 = b1 ; c3 = -a1^2 ; c1 = 1 - c2 - c3
-    filt[n] = c1*(x[n]+x[n-1])/2 + c2*filt[n-1] + c3*filt[n-2]
-    """
+    """Ehlers 2-pole SuperSmoother filter."""
     a1 = np.exp(-1.414 * np.pi / period)
     b1 = 2 * a1 * np.cos(1.414 * np.pi / period)
     c2 = b1
@@ -101,15 +96,14 @@ def super_smoother(series: pd.Series, period: int = 6) -> pd.Series:
     return pd.Series(filt, index=series.index)
 
 
-def compute_drift_histogram(df: pd.DataFrame, ss_period: int = 6):
+def compute_drift_histogram(df: pd.DataFrame, drift_lookback: int = 1, ss_period: int = 6):
     """
-    drift  = close[i] - close[i-1]        (raw candle-to-candle move)
-    smooth = SuperSmoother(drift, period) (Ehlers 2-pole, denoised)
+    drift  = close[i] - close[i-drift_lookback]   (span-N raw move, NaN for first N bars)
+    smooth = SuperSmoother(drift, ss_period)       (Ehlers 2-pole, denoised)
     bar colors: green if smooth>=0 else red
-    dimming: alpha is DIM if |smooth[i]| < |smooth[i-1]|  (bar shrinking vs prior),
-             else BRIGHT (growing or flat)
+    dimming: DIM if |smooth[i]| < |smooth[i-1]| (shrinking), else BRIGHT
     """
-    drift = df["close"].diff().fillna(0.0)
+    drift = df["close"].diff(periods=drift_lookback).fillna(0.0)
     smooth = super_smoother(drift, period=ss_period)
 
     vals = smooth.values
@@ -124,10 +118,10 @@ def compute_drift_histogram(df: pd.DataFrame, ss_period: int = 6):
             a = ALPHA_BRIGHT if growing else ALPHA_DIM
         face_colors.append(mcolors.to_rgba(base, alpha=a))
 
-    return smooth, face_colors
+    return drift, smooth, face_colors
 
 
-def plot_chart(df, smooth, face_colors, symbol, timeframe, ss_period):
+def plot_chart(df, smooth, face_colors, symbol, timeframe, drift_lookback, ss_period):
     fig = plt.figure(figsize=(14, 9), facecolor="#000000")
     gs = fig.add_gridspec(3, 1, height_ratios=[3.0, 1.1, 0.18], hspace=0.10)
     ax_price = fig.add_subplot(gs[0])
@@ -153,20 +147,22 @@ def plot_chart(df, smooth, face_colors, symbol, timeframe, ss_period):
         ax_price.add_patch(rect)
 
     ax_price.set_ylabel("Price", color="#cccccc")
-    ax_price.set_title(f"{symbol}  |  {timeframe}  |  Drift SuperSmoother({ss_period}) Histogram",
-                       color="#ffffff", fontsize=12, pad=8)
+    ax_price.set_title(
+        f"{symbol}  |  {timeframe}  |  Drift(N={drift_lookback}) SuperSmoother({ss_period}) Histogram",
+        color="#ffffff", fontsize=12, pad=8,
+    )
     ax_price.grid(True, color="#222222", linestyle="--", linewidth=0.5)
     ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=timezone.utc))
 
     # ---- Drift histogram panel ----
     ax_hist.bar(smooth.index, smooth.values, width=width, color=face_colors, align="center")
     ax_hist.axhline(0, color="#555555", linewidth=0.8)
-    ax_hist.set_ylabel(f"Drift SS({ss_period})", color="#cccccc")
+    ax_hist.set_ylabel(f"Drift(N={drift_lookback})\nSS({ss_period})", color="#cccccc")
     ax_hist.grid(True, color="#222222", linestyle="--", linewidth=0.5)
 
     ax_info.axis("off")
     latest = smooth.iloc[-1]
-    info_txt = (f"Latest SS({ss_period}) drift = {latest:+.4f}   |   "
+    info_txt = (f"Latest drift(N={drift_lookback}) SS({ss_period}) = {latest:+.4f}   |   "
                 f"candles = {len(df)}   |   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     ax_info.text(0.5, 0.5, info_txt, transform=ax_info.transAxes, ha="center", va="center",
                 color="#aaaaaa", fontsize=9, family="monospace")
@@ -197,7 +193,9 @@ def main():
     parser = argparse.ArgumentParser(description="Binance drift SuperSmoother histogram -> Telegram")
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
     parser.add_argument("--timeframe", default=DEFAULT_TIMEFRAME)
-    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK)
+    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK, help="candles fetched")
+    parser.add_argument("--drift-lookback", type=int, default=DEFAULT_DRIFT_LOOKBACK,
+                        help="N in close[i]-close[i-N]")
     parser.add_argument("--ss-period", type=int, default=DEFAULT_SS_PERIOD, help="Ehlers SuperSmoother period")
     args = parser.parse_args()
 
@@ -205,14 +203,17 @@ def main():
     df = fetch_binance_klines(args.symbol, args.timeframe, args.lookback)
     print(f"Got {len(df)} candles from {df.index[0]} to {df.index[-1]}")
 
-    smooth, face_colors = compute_drift_histogram(df, ss_period=args.ss_period)
-    print(f"Latest SS({args.ss_period}) drift = {smooth.iloc[-1]:+.4f}")
+    drift, smooth, face_colors = compute_drift_histogram(
+        df, drift_lookback=args.drift_lookback, ss_period=args.ss_period
+    )
+    print(f"Latest drift(N={args.drift_lookback}) SS({args.ss_period}) = {smooth.iloc[-1]:+.4f}")
 
     print("Rendering chart ...")
-    img = plot_chart(df, smooth, face_colors, args.symbol, args.timeframe, args.ss_period)
+    img = plot_chart(df, smooth, face_colors, args.symbol, args.timeframe,
+                     args.drift_lookback, args.ss_period)
 
-    caption = (f"{args.symbol} {args.timeframe} | Drift SuperSmoother({args.ss_period}) Histogram\n"
-              f"latest={smooth.iloc[-1]:+.4f}")
+    caption = (f"{args.symbol} {args.timeframe} | Drift(N={args.drift_lookback}) "
+              f"SuperSmoother({args.ss_period}) Histogram\nlatest={smooth.iloc[-1]:+.4f}")
     print("Sending to Telegram ...")
     send_telegram_photo(img, caption=caption)
     print("Done.")
