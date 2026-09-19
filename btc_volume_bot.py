@@ -18,10 +18,10 @@ warnings.filterwarnings("ignore")
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
 
-DEFAULT_SYMBOL = "ONEUSDT"
+DEFAULT_SYMBOL = "NEARUSDT"
 DEFAULT_TIMEFRAME = "1m"
 DEFAULT_LOOKBACK = 400      # candles fetched
-DEFAULT_WINDOW = 21         # rolling window (candles) for buy/sell ratio
+DEFAULT_WINDOW = 16         # rolling window (candles) for buy/sell ratio
 
 
 def fetch_binance_klines(symbol, interval, limit):
