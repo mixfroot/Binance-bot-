@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import time
@@ -7,42 +6,34 @@ import traceback
 from datetime import datetime, timezone
 
 import requests
-import websockets
 
 # ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6263967739")
 
-SYMBOL = "btcusdt"
+VOLUME_THRESHOLD = 50_000_000          # $50 million
+MOVE_THRESHOLD = 1.0                   # 1%
 INTERVAL = "15m"
 INTERVAL_MS = 15 * 60 * 1000
 
-RECONNECT_DELAY = 8
-HEARTBEAT_SECONDS = 360
-VERIFY_CANDLES = 3
+# How many seconds after the official candle close we start scanning
+# (gives Binance a moment to finalize the candle)
+SCAN_DELAY_AFTER_CLOSE = 4
 
-WICK_SHARE_THRESHOLD = 0.50
-WICK_RATIO_THRESHOLD = 0.50
-
-REST_PAGE_DELAY = 0.15
-
-STREAM_URL = f"wss://fstream.binance.com/market/stream?streams={SYMBOL}@kline_{INTERVAL}"
 REST_BASE = "https://fapi.binance.com"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("absorption-bot")
-
-verify_remaining = 0
+log = logging.getLogger("15m-mover-bot")
 
 
 # ==================== TELEGRAM ====================
 def _send_telegram_sync(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=15)
         if r.status_code != 200:
             log.error(f"Telegram send failed: {r.status_code} {r.text}")
     except Exception:
@@ -53,293 +44,169 @@ async def send_telegram(text: str):
     await asyncio.to_thread(_send_telegram_sync, text)
 
 
-# ==================== REGION / RATIO MATH ====================
-def bucket_trades_by_region(trades, open_p, close_p, high_p, low_p):
-    body_top = max(open_p, close_p)
-    body_bottom = min(open_p, close_p)
-
-    regions = {
-        "upper_wick": {"buy": 0.0, "sell": 0.0},
-        "body": {"buy": 0.0, "sell": 0.0},
-        "lower_wick": {"buy": 0.0, "sell": 0.0},
-    }
-
-    for price, qty, is_buyer_maker in trades:
-        if price > body_top:
-            region = "upper_wick"
-        elif price < body_bottom:
-            region = "lower_wick"
-        else:
-            region = "body"
-
-        if is_buyer_maker:
-            regions[region]["sell"] += qty
-        else:
-            regions[region]["buy"] += qty
-
-    return regions
+# ==================== TIME HELPERS ====================
+def get_next_close_timestamp() -> float:
+    """Return the Unix timestamp (seconds) of the next 15m candle close."""
+    now_ms = int(time.time() * 1000)
+    current_open = (now_ms // INTERVAL_MS) * INTERVAL_MS
+    next_close = current_open + INTERVAL_MS
+    return next_close / 1000
 
 
-def region_ratio(region: dict) -> float:
-    b, s = region["buy"], region["sell"]
-    total = b + s
-    if total == 0:
-        return 0.0
-    return (b - s) / total
+def ms_to_readable(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%H:%M UTC")
 
 
-def evaluate_absorption(trades, open_p, close_p, high_p, low_p):
+# ==================== DATA FETCHING ====================
+def fetch_24hr_tickers() -> list:
+    """Get 24hr ticker for all symbols. Weight = 40."""
+    r = requests.get(f"{REST_BASE}/fapi/v1/ticker/24hr", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_last_closed_kline(symbol: str) -> dict | None:
     """
-    Returns: (is_absorption, direction, reason)
-    reason is a short human-readable string explaining which rule fired.
+    Returns the most recently closed 15m kline as a dict with open/close, or None.
+    We request limit=2 and take the older one (guaranteed closed).
     """
-    if close_p == open_p:
-        return False, None, None
-
-    candle_positive = close_p > open_p
-    candle_negative = close_p < open_p
-
-    regions = bucket_trades_by_region(trades, open_p, close_p, high_p, low_p)
-
-    total_buy = sum(r["buy"] for r in regions.values())
-    total_sell = sum(r["sell"] for r in regions.values())
-    delta = total_buy - total_sell
-
-    def buy_share(name):
-        return regions[name]["buy"] / total_buy if total_buy > 0 else 0.0
-
-    def sell_share(name):
-        return regions[name]["sell"] / total_sell if total_sell > 0 else 0.0
-
-    upper_ratio = region_ratio(regions["upper_wick"])
-    lower_ratio = region_ratio(regions["lower_wick"])
-
-    # ---------- BUY ABSORPTION rules ----------
-    if delta > 0 and candle_positive and buy_share("upper_wick") >= WICK_SHARE_THRESHOLD:
-        return True, "BUY", (
-            f"Green candle + positive delta + "
-            f"{buy_share('upper_wick')*100:.0f}% of all buy volume in upper wick"
+    try:
+        r = requests.get(
+            f"{REST_BASE}/fapi/v1/klines",
+            params={"symbol": symbol, "interval": INTERVAL, "limit": 2},
+            timeout=8,
         )
+        r.raise_for_status()
+        data = r.json()
+        if len(data) < 2:
+            return None
 
-    if delta > 0 and candle_negative and buy_share("upper_wick") >= WICK_SHARE_THRESHOLD:
-        return True, "BUY", (
-            f"Red candle + positive delta + "
-            f"{buy_share('upper_wick')*100:.0f}% of all buy volume in upper wick"
-        )
-
-    if delta > 0 and candle_negative and buy_share("body") >= WICK_SHARE_THRESHOLD:
-        return True, "BUY", (
-            f"Red candle + positive delta + "
-            f"{buy_share('body')*100:.0f}% of all buy volume in body"
-        )
-
-    if delta < 0 and candle_negative and upper_ratio >= WICK_RATIO_THRESHOLD:
-        return True, "BUY", (
-            f"Red candle + negative delta + "
-            f"upper wick ratio {upper_ratio:+.2f} (heavy buying in upper wick)"
-        )
-
-    # ---------- SELL / SHORT ABSORPTION rules ----------
-    if delta < 0 and candle_negative and sell_share("lower_wick") >= WICK_SHARE_THRESHOLD:
-        return True, "SELL", (
-            f"Red candle + negative delta + "
-            f"{sell_share('lower_wick')*100:.0f}% of all sell volume in lower wick"
-        )
-
-    if delta < 0 and candle_positive and sell_share("lower_wick") >= WICK_SHARE_THRESHOLD:
-        return True, "SELL", (
-            f"Green candle + negative delta + "
-            f"{sell_share('lower_wick')*100:.0f}% of all sell volume in lower wick"
-        )
-
-    if delta < 0 and candle_positive and sell_share("body") >= WICK_SHARE_THRESHOLD:
-        return True, "SELL", (
-            f"Green candle + negative delta + "
-            f"{sell_share('body')*100:.0f}% of all sell volume in body"
-        )
-
-    if delta > 0 and candle_positive and lower_ratio <= -WICK_RATIO_THRESHOLD:
-        return True, "SELL", (
-            f"Green candle + positive delta + "
-            f"lower wick ratio {lower_ratio:+.2f} (heavy selling in lower wick)"
-        )
-
-    return False, None, None
-
-
-def absorption_label(direction: str) -> str:
-    return "BUY ABSORPTION" if direction == "BUY" else "SHORT ABSORPTION"
-
-
-# ==================== FETCH ALL TRADES FOR ONE CANDLE ====================
-def fetch_agg_trades_sync(open_time: int, close_time: int) -> list:
-    trades = []
-    from_id = None
-    max_pages = 40
-
-    for _ in range(max_pages):
-        params = {
-            "symbol": SYMBOL.upper(),
-            "startTime": open_time,
-            "endTime": close_time,
-            "limit": 1000,
+        # data[0] is older (closed), data[1] is the current forming candle
+        k = data[0]
+        return {
+            "open_time": int(k[0]),
+            "open": float(k[1]),
+            "close": float(k[4]),
+            "high": float(k[2]),
+            "low": float(k[3]),
         }
-        if from_id is not None:
-            params = {
-                "symbol": SYMBOL.upper(),
-                "fromId": from_id,
-                "limit": 1000,
-            }
-
-        r = requests.get(f"{REST_BASE}/fapi/v1/aggTrades", params=params, timeout=10)
-        if r.status_code != 200:
-            raise RuntimeError(f"aggTrades HTTP {r.status_code}: {r.text[:300]}")
-
-        batch = r.json()
-        if not batch:
-            break
-
-        for t in batch:
-            t_time = int(t["T"])
-            if t_time < open_time:
-                continue
-            if t_time > close_time:
-                return trades
-
-            price = float(t["p"])
-            qty = float(t["q"])
-            is_buyer_maker = t["m"]
-            trades.append((price, qty, is_buyer_maker))
-
-        if len(batch) < 1000:
-            break
-
-        from_id = int(batch[-1]["a"]) + 1
-        time.sleep(REST_PAGE_DELAY)
-
-    return trades
+    except Exception as e:
+        log.warning(f"Failed to fetch kline for {symbol}: {e}")
+        return None
 
 
-async def fetch_agg_trades(open_time: int, close_time: int) -> list:
-    return await asyncio.to_thread(fetch_agg_trades_sync, open_time, close_time)
-
-
-# ==================== CORE: PROCESS A CLOSED CANDLE ====================
-async def process_closed_candle(k: dict):
-    global verify_remaining
-
-    open_time = int(k["t"])
-    close_time = open_time + INTERVAL_MS - 1
-
-    open_price = float(k["o"])
-    close_price = float(k["c"])
-    high_price = float(k["h"])
-    low_price = float(k["l"])
+# ==================== SCAN LOGIC ====================
+async def run_scan():
+    log.info("Starting 15m close scan...")
 
     try:
-        trades = await fetch_agg_trades(open_time, close_time)
-        log.info(f"Fetched {len(trades)} trades for candle open={open_time}")
+        tickers = await asyncio.to_thread(fetch_24hr_tickers)
+    except Exception:
+        err = traceback.format_exc()
+        log.error(err)
+        await send_telegram(f"⚠️ Failed to fetch 24hr tickers:\n{err[-400:]}")
+        return
 
-        is_absorption, direction, reason = evaluate_absorption(
-            trades, open_price, close_price, high_price, low_price
+    # First filter: volume + USDT perpetual-looking symbols
+    candidates = []
+    for t in tickers:
+        symbol = t["symbol"]
+        if not symbol.endswith("USDT"):
+            continue
+        # Skip delivery contracts (they contain digits in a certain way, simple heuristic)
+        if any(c.isdigit() for c in symbol.replace("USDT", "")):
+            continue
+
+        quote_vol = float(t.get("quoteVolume", 0))
+        if quote_vol < VOLUME_THRESHOLD:
+            continue
+
+        candidates.append({
+            "symbol": symbol,
+            "quote_volume": quote_vol,
+        })
+
+    log.info(f"Volume filter passed: {len(candidates)} symbols")
+
+    # Now check the actual 15m move for each candidate
+    movers = []
+    for c in candidates:
+        kline = await asyncio.to_thread(fetch_last_closed_kline, c["symbol"])
+        if not kline:
+            continue
+
+        open_p = kline["open"]
+        close_p = kline["close"]
+        if open_p <= 0:
+            continue
+
+        pct = (close_p - open_p) / open_p * 100
+
+        if abs(pct) >= MOVE_THRESHOLD:
+            movers.append({
+                "symbol": c["symbol"],
+                "pct": pct,
+                "volume": c["quote_volume"],
+                "open_time": kline["open_time"],
+            })
+
+        # Tiny polite delay so we don't burst the API
+        await asyncio.sleep(0.05)
+
+    # Sort by absolute move (strongest first)
+    movers.sort(key=lambda x: abs(x["pct"]), reverse=True)
+
+    # Build message
+    if not movers:
+        msg = (
+            f"15m Close Scan ({ms_to_readable(int(time.time()*1000))})\n"
+            f"No coins met the criteria (≥{MOVE_THRESHOLD}% move + ≥${VOLUME_THRESHOLD//1_000_000}M volume)"
         )
-
-        if is_absorption:
-            msg = (
-                f"{SYMBOL.upper()} — {absorption_label(direction)}\n"
-                f"Reason: {reason}"
+    else:
+        lines = [f"15m Close Scan ({ms_to_readable(movers[0]['open_time'] + INTERVAL_MS)})\n"]
+        for m in movers:
+            arrow = "▲" if m["pct"] > 0 else "▼"
+            vol_m = m["volume"] / 1_000_000
+            lines.append(
+                f"{arrow} {m['symbol']:<12} {m['pct']:+.2f}%   Vol: ${vol_m:.0f}M"
             )
-            await send_telegram(msg)
-        else:
-            log.info(f"Candle closed. No absorption. O:{open_price} C:{close_price}")
+        msg = "\n".join(lines)
 
-        if verify_remaining > 0:
-            if close_price == open_price:
-                await send_telegram(
-                    f"🔍 Verification candle ({VERIFY_CANDLES - verify_remaining + 1}/{VERIFY_CANDLES})\n"
-                    f"{SYMBOL.upper()} {INTERVAL}: DOJI (O==C=={open_price}) — data is flowing."
-                )
-            elif not is_absorption:
-                direction_label = "GREEN" if close_price > open_price else "RED"
-                await send_telegram(
-                    f"🔍 Verification candle ({VERIFY_CANDLES - verify_remaining + 1}/{VERIFY_CANDLES})\n"
-                    f"{SYMBOL.upper()} {INTERVAL} closed {direction_label} — "
-                    f"no absorption, confirming data is live."
-                )
-            verify_remaining -= 1
-
-    except Exception:
-        err = traceback.format_exc()
-        log.error(err)
-        await send_telegram(f"⚠️ Error while evaluating candle close:\n{err[-500:]}")
+    await send_telegram(msg)
+    log.info(f"Scan complete. {len(movers)} movers found.")
 
 
-# ==================== HEARTBEAT ====================
-async def heartbeat_task():
-    while True:
-        await asyncio.sleep(HEARTBEAT_SECONDS)
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        await send_telegram(f"❤️ Heartbeat — bot is alive ({now})")
-
-
-# ==================== WEBSOCKET LOOP ====================
-async def process_message(raw: str):
-    try:
-        msg = json.loads(raw)
-        data = msg.get("data", {})
-        k = data.get("k")
-        if not k:
-            return
-
-        if k.get("x"):
-            asyncio.create_task(process_closed_candle(k))
-
-    except Exception:
-        err = traceback.format_exc()
-        log.error(err)
-        await send_telegram(f"⚠️ Error processing message:\n{err[-500:]}")
-
-
-async def run_forever():
-    global verify_remaining
-
+# ==================== MAIN LOOP ====================
+async def main_loop():
     await send_telegram(
-        f"🚀 Bot started — watching {SYMBOL.upper()} {INTERVAL} (close-only mode).\n"
-        f"Will confirm the first {VERIFY_CANDLES} closed candles."
+        "🚀 15m Mover Bot started\n"
+        f"Looking for coins with ≥{MOVE_THRESHOLD}% move on the closed 15m candle\n"
+        f"and ≥${VOLUME_THRESHOLD//1_000_000}M 24h futures volume.\n"
+        "Will alert after every 15m close (including when none qualify)."
     )
-    first_connect = True
 
     while True:
         try:
-            async with websockets.connect(STREAM_URL, ping_interval=20, ping_timeout=20) as ws:
-                if not first_connect:
-                    await send_telegram("✅ Reconnected successfully.")
-                first_connect = False
-                verify_remaining = VERIFY_CANDLES
-                log.info("Connected to Binance websocket.")
+            next_close = get_next_close_timestamp()
+            now = time.time()
+            sleep_seconds = next_close - now + SCAN_DELAY_AFTER_CLOSE
 
-                async for raw in ws:
-                    await process_message(raw)
+            if sleep_seconds > 0:
+                log.info(f"Sleeping {sleep_seconds:.1f}s until next 15m close + {SCAN_DELAY_AFTER_CLOSE}s")
+                await asyncio.sleep(sleep_seconds)
+            else:
+                # We somehow missed it, run immediately and continue
+                log.warning("Missed the close window, scanning now")
 
-        except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-            log.error(f"Connection lost: {e}")
-            await send_telegram(
-                f"❌ Websocket disconnected: {e}\nReconnecting in {RECONNECT_DELAY}s..."
-            )
+            await run_scan()
 
         except Exception:
             err = traceback.format_exc()
             log.error(err)
-            await send_telegram(
-                f"⚠️ Unexpected error:\n{err[-500:]}\nReconnecting in {RECONNECT_DELAY}s..."
-            )
-
-        await asyncio.sleep(RECONNECT_DELAY)
-
-
-async def main():
-    await asyncio.gather(run_forever(), heartbeat_task())
+            await send_telegram(f"⚠️ Unexpected error in main loop:\n{err[-500:]}")
+            # Wait a bit before retrying so we don't spam
+            await asyncio.sleep(30)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_loop())
