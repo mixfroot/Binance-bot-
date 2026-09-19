@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID = "6263967739"
 
-DEFAULT_SYMBOL = "BTCUSDT"
+DEFAULT_SYMBOL = "ONEUSDT"
 DEFAULT_TIMEFRAME = "1m"
 DEFAULT_LOOKBACK = 400      # candles fetched
 DEFAULT_WINDOW = 21         # rolling window (candles) for buy/sell ratio
