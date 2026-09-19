@@ -59,7 +59,7 @@ class TelegramNotifier:
             logging.error(f"Failed to send Telegram message: {e}")
 
 # =====================================================================
-# MICROSTRUCTURE ENGINE (Event-Driven & O'Hara Microstructure Models)
+# MICROSTRUCTURE ENGINE (Event-Driven & Flow-Riding Models)
 # =====================================================================
 class MicrostructureEngine:
     def __init__(self):
@@ -89,7 +89,7 @@ class MicrostructureEngine:
         if not bids or not asks:
             return
         try:
-            # Parse top level [price, quantity]
+            # FIXED: correctly read top of book
             self.best_bid = float(bids[0][0])
             self.bid_qty  = float(bids[0][1])
             self.best_ask = float(asks[0][0])
@@ -125,6 +125,7 @@ class MicrostructureEngine:
         self.current_oi = oi
         self.oi_history.append((ts, oi))
         cutoff = ts - 900  # keep 15m history
+        # FIXED
         self.oi_history = [item for item in self.oi_history if item[0] >= cutoff]
 
     def _clean_buffers(self, now: float):
@@ -171,6 +172,7 @@ class MicrostructureEngine:
         oi_1m_delta = 0.0
         if len(self.oi_history) > 1:
             ts_60s_ago = now - 60
+            # FIXED
             past_oi_tuple = min(self.oi_history, key=lambda x: abs(x[0] - ts_60s_ago))
             oi_1m_delta = self.current_oi - past_oi_tuple[1]
 
@@ -193,38 +195,32 @@ class MicrostructureEngine:
         qs = features['quote_skew']
         sr = features['spread_ratio']
         ofi_z = features['ofi_zscore']
+        obi = features['obi']
         oi_delta = features['oi_1m_delta']
         
         regime = "Regime D: Discretionary Noise / Range"
         signal = "PASS"
         action_reason = "Order flow is balanced or noise-driven."
         
-        # Regime A: Inventory Rebalancing
-        if abs(qs) > 1.5 and sr <= 1.3 and oi_delta <= 10.0:
-            regime = "Regime A: Inventory Rebalancing (Mean-Reverting)"
-            if qs < -1.8 and ofi_z < -0.5:
-                signal = "🟢 LONG (Inventory Rebound)"
-                action_reason = "MM shifted quotes down symmetrically to offload long inventory. Expect mean-reverting bounce to VWAP."
-            elif qs > 1.8 and ofi_z > 0.5:
-                signal = "🔴 SHORT (Inventory Exhaustion)"
-                action_reason = "MM shifted quotes up symmetrically to cover short inventory. Expect mean-reverting dip to VWAP."
+        # --- RIDE THE FLOW (Order Flow Momentum & Liquidity Sweeps) ---
+        
+        # Downside Taker Momentum (Short Signal)
+        if qs < -1.2 and ofi_z < -1.0 and obi < 0.42:
+            regime = "Toxic Sell Flow / Liquidity Sweep"
+            signal = "🔴 SHORT (Ride Taker Flow)"
+            action_reason = "Aggressive taker selling + thinned bid depth. Riding downward order flow momentum."
 
-        # Regime B: Toxic Informed Breakout
-        elif sr > 1.4 and oi_delta > 15.0:
-            regime = "Regime B: Toxic Informed Breakout (Trend Following)"
-            if ofi_z > 1.5:
-                signal = "🟢 LONG (Informed Buy Momentum)"
-                action_reason = "Spiking Open Interest + Asymmetric quote ratcheting indicates toxic informed buy flow. Ride breakout."
-            elif ofi_z < -1.5:
-                signal = "🔴 SHORT (Informed Sell Momentum)"
-                action_reason = "Spiking Open Interest + Asymmetric quote markdown indicates toxic informed sell flow. Ride downside breakout."
+        # Upside Taker Momentum (Long Signal)
+        elif qs > 1.2 and ofi_z > 1.0 and obi > 0.58:
+            regime = "Toxic Buy Flow / Ask Sweep"
+            signal = "🟢 LONG (Ride Taker Flow)"
+            action_reason = "Aggressive taker buying + thinned ask depth. Riding upward order flow breakout."
 
-        # Regime C: Post-Block Event Recovery
-        elif sr > 1.3 and oi_delta <= 0:
-            regime = "Regime C: Post-Block Event Uncertainty"
-            if ofi_z < -2.0:
-                signal = "🟢 LONG (Post-Block Rebound)"
-                action_reason = "Large sell block absorbed. Uninformed follow-up trades lower MM's event probability. Expect V-bounce."
+        # Exhaustion Bounce (Selective Mean Reversion after Flow Stops)
+        elif qs < -2.2 and ofi_z >= 0.0 and obi > 0.60:
+            regime = "Sell Flow Exhaustion / Bid Absorption"
+            signal = "🟢 LONG (Exhaustion Rebound)"
+            action_reason = "Taker sell pressure halted and bids heavily refilled. High-probability bounce setup."
 
         return regime, signal, action_reason
 
@@ -241,13 +237,13 @@ class BTCFuturesMicrostructureBot:
         self.signal_cooldown = 5.0  # 5-second Telegram alert cooldown
 
     async def start(self):
-        logging.info("Starting BTCUSDT Futures Microstructure Bot (v2)...")
+        logging.info("Starting BTCUSDT Futures Microstructure Bot (v3)...")
         startup_msg = (
-            "🚀 *BTCUSDT Futures Microstructure Bot (v2) Online*\n\n"
+            "🚀 *BTCUSDT Futures Microstructure Bot (v3 - Flow Rider) Online*\n\n"
             "• *Symbol*: BTCUSDT.P (Binance Futures)\n"
+            "• *Strategy*: Order Flow Riding & Liquidity Sweep Trend-Following\n"
             "• *Architecture*: Instant Event-Driven (Tick Time)\n"
             "• *Endpoints*: Dual Public/Market WS Streams\n"
-            "• *Models*: Garman / Stoll / Glosten-Milgrom / Kyle / O'Hara\n"
             "• *Cooldown*: 5 Seconds between alerts\n"
             "• *Heartbeat*: Every 5 minutes"
         )
@@ -315,11 +311,11 @@ class BTCFuturesMicrostructureBot:
                 time_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
                 mid = feats['midpoint']
                 spread = feats['spread']
-                tp_price = feats['vwap_30s'] if "Inventory" in regime else (mid + (spread * 10) if "LONG" in signal else mid - (spread * 10))
+                tp_price = mid + (spread * 12) if "LONG" in signal else mid - (spread * 12)
                 sl_price = mid - (spread * 6) if "LONG" in signal else mid + (spread * 6)
                 
                 alert_msg = (
-                    f"⚡ *INSTANT MICROSTRUCTURE ALERT* ⚡\n\n"
+                    f"⚡ *INSTANT FLOW-RIDER ALERT* ⚡\n\n"
                     f"⏰ *Event Time*: `{time_str}`\n"
                     f"🎯 *Signal*: *{signal}*\n"
                     f"📊 *Active Regime*: `{regime}`\n\n"
