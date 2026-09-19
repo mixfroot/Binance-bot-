@@ -20,8 +20,8 @@ CHAT_ID = "6263967739"
 
 DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_TIMEFRAME = "1m"
-DEFAULT_LOOKBACK = 300
-DEFAULT_EMA = 9  # smoothing on the ratio, 0/1 = no smoothing
+DEFAULT_LOOKBACK = 400      # candles fetched
+DEFAULT_WINDOW = 21         # rolling window (candles) for buy/sell ratio
 
 
 def fetch_binance_klines(symbol, interval, limit):
@@ -70,22 +70,26 @@ def fetch_binance_klines(symbol, interval, limit):
     return df[["open", "high", "low", "close", "volume", "taker_buy_base"]].tail(limit)
 
 
-def compute_taker_ratio(df, ema_period=9):
+def compute_rolling_taker_ratio(df, window=20):
     """
-    buy_vol  = taker_buy_base            (aggressive buys)
-    sell_vol = volume - taker_buy_base   (aggressive sells)
-    ratio    = (buy - sell) / (buy + sell)  -> bounded [-1, +1]
+    Per-candle: buy_vol = taker_buy_base, sell_vol = volume - taker_buy_base.
+    Rolling: sum buy_vol and sell_vol over the trailing `window` candles,
+    THEN compute ratio on the sums -> volume-weighted, not just averaged ratios.
+    ratio = (sum_buy - sum_sell) / (sum_buy + sum_sell)  in [-1, +1]
     """
     buy_vol = df["taker_buy_base"]
     sell_vol = df["volume"] - df["taker_buy_base"]
-    total = buy_vol + sell_vol
-    ratio = np.where(total > 0, (buy_vol - sell_vol) / total, 0.0)
-    ratio = pd.Series(ratio, index=df.index)
-    ratio_smooth = ratio.ewm(span=max(ema_period, 1), adjust=False).mean() if ema_period > 1 else ratio
-    return ratio, ratio_smooth, buy_vol, sell_vol
+
+    roll_buy = buy_vol.rolling(window=window, min_periods=window).sum()
+    roll_sell = sell_vol.rolling(window=window, min_periods=window).sum()
+    roll_total = roll_buy + roll_sell
+
+    ratio = (roll_buy - roll_sell) / roll_total.replace(0, np.nan)
+    ratio = ratio.fillna(0.0)
+    return ratio, roll_buy, roll_sell
 
 
-def plot_chart(df, ratio, ratio_smooth, symbol, timeframe, ema_period):
+def plot_chart(df, ratio, symbol, timeframe, window):
     fig = plt.figure(figsize=(14, 9), facecolor="#000000")
     gs = fig.add_gridspec(3, 1, height_ratios=[3.0, 1.1, 0.18], hspace=0.10)
     ax_price = fig.add_subplot(gs[0])
@@ -111,28 +115,24 @@ def plot_chart(df, ratio, ratio_smooth, symbol, timeframe, ema_period):
         ax_price.add_patch(rect)
 
     ax_price.set_ylabel("Price", color="#cccccc")
-    ax_price.set_title(f"{symbol}  |  {timeframe}  |  Taker Buy/Sell Volume Ratio",
+    ax_price.set_title(f"{symbol}  |  {timeframe}  |  Rolling Taker Buy/Sell Ratio (window={window})",
                        color="#ffffff", fontsize=12, pad=8)
     ax_price.grid(True, color="#222222", linestyle="--", linewidth=0.5)
     ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=timezone.utc))
 
-    # ---- Ratio panel: bars colored by sign, + smoothed line ----
-    colors = np.where(ratio.values >= 0, "#00e676", "#ff1744")
-    ax_ratio.bar(ratio.index, ratio.values, width=width, color=colors, alpha=0.55, align="center")
-    if ema_period > 1:
-        ax_ratio.plot(ratio_smooth.index, ratio_smooth.values, color="#00bcd4", linewidth=1.4,
-                     label=f"EMA({ema_period})")
-        ax_ratio.legend(loc="upper left", fontsize=8, facecolor="#111111",
-                        edgecolor="#333333", labelcolor="#eeeeee")
+    # ---- Rolling ratio panel ----
+    ratio_plot = ratio.dropna()
+    colors = np.where(ratio_plot.values >= 0, "#00e676", "#ff1744")
+    ax_ratio.bar(ratio_plot.index, ratio_plot.values, width=width, color=colors, alpha=0.6, align="center")
+    ax_ratio.plot(ratio_plot.index, ratio_plot.values, color="#00bcd4", linewidth=1.1, alpha=0.8)
     ax_ratio.axhline(0, color="#555555", linewidth=0.8)
     ax_ratio.set_ylim(-1.05, 1.05)
-    ax_ratio.set_ylabel("Buy/Sell ratio", color="#cccccc")
+    ax_ratio.set_ylabel(f"Buy/Sell ratio\n(roll {window})", color="#cccccc")
     ax_ratio.grid(True, color="#222222", linestyle="--", linewidth=0.5)
 
     ax_info.axis("off")
     latest = ratio.iloc[-1]
-    latest_smooth = ratio_smooth.iloc[-1]
-    info_txt = (f"Latest ratio = {latest:+.3f}   |   EMA({ema_period}) = {latest_smooth:+.3f}   |   "
+    info_txt = (f"Latest rolling({window}) ratio = {latest:+.3f}   |   "
                 f"candles = {len(df)}   |   {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     ax_info.text(0.5, 0.5, info_txt, transform=ax_info.transAxes, ha="center", va="center",
                 color="#aaaaaa", fontsize=9, family="monospace")
@@ -160,25 +160,25 @@ def send_telegram_photo(image_bytes, caption=""):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Binance taker buy/sell ratio chart -> Telegram")
+    parser = argparse.ArgumentParser(description="Binance rolling taker buy/sell ratio -> Telegram")
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
     parser.add_argument("--timeframe", default=DEFAULT_TIMEFRAME)
-    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK)
-    parser.add_argument("--ema", type=int, default=DEFAULT_EMA, help="EMA smoothing period on ratio, 0/1=off")
+    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK, help="candles to fetch")
+    parser.add_argument("--window", type=int, default=DEFAULT_WINDOW, help="rolling window (candles) for ratio")
     args = parser.parse_args()
 
     print(f"Fetching {args.symbol} {args.timeframe} last {args.lookback} candles ...")
     df = fetch_binance_klines(args.symbol, args.timeframe, args.lookback)
     print(f"Got {len(df)} candles from {df.index[0]} to {df.index[-1]}")
 
-    ratio, ratio_smooth, buy_vol, sell_vol = compute_taker_ratio(df, ema_period=args.ema)
-    print(f"Latest ratio = {ratio.iloc[-1]:+.3f}  EMA = {ratio_smooth.iloc[-1]:+.3f}")
+    ratio, roll_buy, roll_sell = compute_rolling_taker_ratio(df, window=args.window)
+    print(f"Latest rolling({args.window}) ratio = {ratio.iloc[-1]:+.3f}")
 
     print("Rendering chart ...")
-    img = plot_chart(df, ratio, ratio_smooth, args.symbol, args.timeframe, args.ema)
+    img = plot_chart(df, ratio, args.symbol, args.timeframe, args.window)
 
-    caption = (f"{args.symbol} {args.timeframe} | Taker Buy/Sell Ratio (EMA{args.ema})\n"
-              f"latest={ratio.iloc[-1]:+.3f}  ema={ratio_smooth.iloc[-1]:+.3f}")
+    caption = (f"{args.symbol} {args.timeframe} | Rolling Taker Buy/Sell Ratio (window={args.window})\n"
+              f"latest={ratio.iloc[-1]:+.3f}")
     print("Sending to Telegram ...")
     send_telegram_photo(img, caption=caption)
     print("Done.")
