@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-BTCUSDT LOB Microstructure + Thermodynamics Telegram Bot
-- Multi-Level Order-Flow Imbalance (MLOFI) with Ridge weights
-- Order Book Thermodynamics (Temperature + Delta Entropy)
-- Edge-triggered alerts + 60s cooldown
+BTCUSDT TWI + CVD State Change Bot
+- 7-second Trade Weighted Imbalance (TWI)
+- 30-second majority vote
+- Extra rule: SHORT only allowed when 30s CVD is also negative
+- Alerts only on state change
+- First 30 seconds = warm-up
 """
 
 import asyncio
@@ -15,32 +17,29 @@ from collections import deque
 from datetime import datetime, timezone
 
 import aiohttp
-import numpy as np
 import websockets
 
 # =====================================================================
-# CONFIGURATION
+# CONFIG
 # =====================================================================
 SYMBOL = "btcusdt"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs")
 CHAT_ID = os.getenv("CHAT_ID", "6263967739")
 
-# Future-proof dual streams
-DEPTH_WS = f"wss://fstream.binance.com/public/stream?streams={SYMBOL}@depth20@100ms"
 TRADE_WS = f"wss://fstream.binance.com/market/stream?streams={SYMBOL}@aggTrade"
+DEPTH_WS = f"wss://fstream.binance.com/public/stream?streams={SYMBOL}@depth5@100ms"
 
-# Paper constants
-GRAVITY_G = 0.29581494
-ACTIVE_DEPTH_ALPHA_TICKS = 50
-WINDOW_DT = 10.0
-TICK_SIZE = 0.1
+TWI_WINDOW = 7.0
+STATE_WINDOW = 30.0
+WARMUP_SECONDS = 30.0
+STATE_COOLDOWN = 5.0
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("LOB-Thermo")
+log = logging.getLogger("TWI-CVD")
 
 
 # =====================================================================
@@ -52,206 +51,182 @@ class TelegramNotifier:
         self.chat_id = chat_id
         self.url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    async def send(self, text: str, parse_mode: str = "HTML"):
+    async def send(self, text: str):
         if not self.token or not self.chat_id:
-            log.warning("Telegram credentials missing – alert skipped")
             return
         payload = {
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": parse_mode,
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(self.url, json=payload, timeout=10) as resp:
                     if resp.status != 200:
-                        body = await resp.text()
-                        log.error(f"Telegram error {resp.status}: {body}")
+                        log.error(f"Telegram error: {await resp.text()}")
         except Exception as e:
-            log.error(f"Telegram send failed: {e}")
+            log.error(f"Telegram failed: {e}")
 
 
 # =====================================================================
 # ENGINE
 # =====================================================================
-class BinanceLOBThermodynamicsEngine:
-    def __init__(self, symbol: str = "btcusdt"):
-        self.symbol = symbol.lower()
+class TWICVDStateBot:
+    def __init__(self):
         self.notifier = TelegramNotifier(BOT_TOKEN, CHAT_ID)
 
-        # Load calibrated Ridge β (or use defaults)
-        weights_file = f"mlofi_weights_{self.symbol}.json"
-        if os.path.exists(weights_file):
-            with open(weights_file) as f:
-                data = json.load(f)
-            self.ridge_beta = np.array(data["ridge_beta"], dtype=float)
-            log.info(f"Loaded Ridge weights from {weights_file}")
-        else:
-            self.ridge_beta = np.array(
-                [2.17, 1.99, 1.85, 1.44, 1.21, 1.09, 1.01, 0.92, 0.89, 1.01],
-                dtype=float
-            )
-            log.warning(f"{weights_file} not found – using default β")
+        self.best_bid = 0.0
+        self.best_ask = 0.0
+        self.mid = 0.0
 
-        self.snapshots = deque()   # (timestamp, bids, asks)
-        self.trades = deque()      # (timestamp, price, qty, is_buyer_maker)
+        # trades: (timestamp, qty, is_buyer_maker)
+        self.trades = deque()
 
-        self.cooldowns = {"MLOFI": 0.0, "ENTROPY": 0.0}
-        self.mlofi_armed = True
-        self.mlofi_history = deque(maxlen=600)
+        # history of 7s TWI: (timestamp, twi_value)
+        self.twi_history = deque()
 
+        self.start_time = time.time()
+        self.current_state = None          # "LONG" or "SHORT"
+        self.last_alert_time = 0.0
         self.running = True
-        self.last_eval = 0.0
 
-    def _clean_buffers(self, now: float):
-        cutoff = now - WINDOW_DT
-        while self.snapshots and self.snapshots[0][0] < cutoff:
-            self.snapshots.popleft()
+    def update_depth(self, bids, asks):
+        if not bids or not asks:
+            return
+        try:
+            self.best_bid = float(bids[0][0])
+            self.best_ask = float(asks[0][0])
+            self.mid = (self.best_bid + self.best_ask) / 2.0
+        except Exception:
+            pass
+
+    def add_trade(self, price: float, qty: float, is_buyer_maker: bool, ts: float):
+        self.trades.append((ts, qty, is_buyer_maker))
+        # keep last \~40 seconds of trades (enough for 30s CVD + 7s TWI)
+        cutoff = ts - 40.0
         while self.trades and self.trades[0][0] < cutoff:
             self.trades.popleft()
 
-    def _calc_mlofi(self):
-        if len(self.snapshots) < 2:
-            return 0.0, 0.0
-
-        _, t0_bids, t0_asks = self.snapshots[0]
-        _, t1_bids, t1_asks = self.snapshots[-1]
-
-        e_m = np.zeros(10)
-        for m in range(10):
-            # Bid ΔW
-            if m < len(t1_bids) and m < len(t0_bids):
-                b1, r1 = t1_bids[m]
-                b0, r0 = t0_bids[m]
-                if b1 > b0:
-                    delta_w = r1
-                elif b1 == b0:
-                    delta_w = r1 - r0
+    def compute_7s_twi(self, now: float) -> float:
+        cutoff = now - TWI_WINDOW
+        buy_vol = 0.0
+        sell_vol = 0.0
+        for ts, qty, is_buyer_maker in self.trades:
+            if ts >= cutoff:
+                if is_buyer_maker:
+                    sell_vol += qty
                 else:
-                    delta_w = -r0
-            else:
-                delta_w = 0.0
+                    buy_vol += qty
+        total = buy_vol + sell_vol
+        if total < 1e-8:
+            return 0.0
+        return (buy_vol - sell_vol) / total
 
-            # Ask ΔV
-            if m < len(t1_asks) and m < len(t0_asks):
-                a1, q1 = t1_asks[m]
-                a0, q0 = t0_asks[m]
-                if a1 > a0:
-                    delta_v = -q0
-                elif a1 == a0:
-                    delta_v = q1 - q0
+    def compute_30s_cvd(self, now: float) -> float:
+        """Cumulative Volume Delta over last 30 seconds.
+        Positive = more aggressive buying, Negative = more aggressive selling
+        """
+        cutoff = now - STATE_WINDOW
+        cvd = 0.0
+        for ts, qty, is_buyer_maker in self.trades:
+            if ts >= cutoff:
+                if is_buyer_maker:
+                    cvd -= qty          # sell aggressor
                 else:
-                    delta_v = q1
-            else:
-                delta_v = 0.0
+                    cvd += qty          # buy aggressor
+        return cvd
 
-            e_m[m] = delta_w - delta_v
+    def update_state(self, now: float):
+        # 1. Current 7-second TWI
+        twi = self.compute_7s_twi(now)
+        self.twi_history.append((now, twi))
 
-        raw_score = float(np.dot(e_m, self.ridge_beta))
-        self.mlofi_history.append(raw_score)
+        # keep last \~40s of TWI samples
+        cutoff = now - 40.0
+        while self.twi_history and self.twi_history[0][0] < cutoff:
+            self.twi_history.popleft()
 
-        if len(self.mlofi_history) > 10:
-            mu = np.mean(self.mlofi_history)
-            sigma = np.std(self.mlofi_history) + 1e-8
-            z = (raw_score - mu) / sigma
-        else:
-            z = 0.0
-        return raw_score, z
-
-    def _calc_thermodynamics(self):
-        if not self.snapshots:
-            return 0.0, 0.0
-
-        _, bids, asks = self.snapshots[-1]
-        if not bids or not asks:
-            return 0.0, 0.0
-
-        b1 = bids[0][0]
-        a1 = asks[0][0]
-        alpha = ACTIVE_DEPTH_ALPHA_TICKS * TICK_SIZE
-
-        pe_bid = sum(s * GRAVITY_G * max(0.0, p - (b1 - alpha)) for p, s in bids[:20])
-        pe_ask = sum(s * GRAVITY_G * max(0.0, (a1 + alpha) - p) for p, s in asks[:20])
-        total_pe = pe_bid + pe_ask
-
-        delta_ke = 0.0
-        for ts, price, qty, is_buyer_maker in self.trades:
-            mid = (b1 + a1) / 2.0
-            v = abs(price - mid)
-            delta_ke += 0.5 * qty * (v ** 2)
-
-        temperature = delta_ke + total_pe
-        delta_entropy = delta_ke / max(temperature, 1e-6)
-        return temperature, delta_entropy
-
-    async def evaluate_and_alert(self):
-        now = time.time()
-        if now - self.last_eval < 1.0:
+        if len(self.twi_history) < 5:
             return
-        self.last_eval = now
 
-        self._clean_buffers(now)
-        raw_mlofi, z_mlofi = self._calc_mlofi()
-        temperature, delta_entropy = self._calc_thermodynamics()
+        # 2. Last 30 seconds of TWI values
+        recent_twi = [v for t, v in self.twi_history if t >= now - STATE_WINDOW]
+        if len(recent_twi) < 3:
+            return
 
-        # MLOFI Impulse (edge + hysteresis)
-        if abs(z_mlofi) >= 2.0 and self.mlofi_armed and now > self.cooldowns["MLOFI"]:
-            direction = "🟢 BULLISH IMPULSE" if z_mlofi > 0 else "🔴 BEARISH IMPULSE"
-            msg = (
-                f"<b>{direction} [{self.symbol.upper()} Perp]</b>\n"
-                f"• MLOFI Score: {raw_mlofi:.1f}  (Z = {z_mlofi:.2f})\n"
-                f"• Action: Heavy net order flow accumulating deep in the LOB.\n"
-                f"• Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
-            )
-            await self.notifier.send(msg)
-            self.cooldowns["MLOFI"] = now + 60.0
-            self.mlofi_armed = False
-            log.info(f"MLOFI alert  Z={z_mlofi:.2f}")
+        bid_heavy = sum(1 for v in recent_twi if v > 0.05)
+        ask_heavy = sum(1 for v in recent_twi if v < -0.05)
 
-        elif abs(z_mlofi) <= 1.0:
-            self.mlofi_armed = True
+        # 3. 30-second CVD
+        cvd_30s = self.compute_30s_cvd(now)
 
-        # Volatility Expansion
-        if delta_entropy > 0.35 and now > self.cooldowns["ENTROPY"]:
-            msg = (
-                f"<b>⚠️ VOLATILITY EXPANSION WARNING [{self.symbol.upper()} Perp]</b>\n"
-                f"• Delta Entropy (ΔS): {delta_entropy:.3f}\n"
-                f"• Temperature (T): {temperature:.1f}\n"
-                f"• Action: Order-book chaos detected – expect local vol expansion.\n"
-                f"• Time: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
-            )
-            await self.notifier.send(msg)
-            self.cooldowns["ENTROPY"] = now + 60.0
-            log.info(f"Entropy alert  ΔS={delta_entropy:.3f}")
+        # 4. Decide candidate state
+        new_state = None
+        if bid_heavy > ask_heavy:
+            new_state = "LONG"
+        elif ask_heavy > bid_heavy and cvd_30s < 0:          # ← extra CVD filter only for SHORT
+            new_state = "SHORT"
+        else:
+            return   # mixed or SHORT without negative CVD → stay silent
+
+        # 5. Warm-up
+        if now - self.start_time < WARMUP_SECONDS:
+            self.current_state = new_state
+            return
+
+        # 6. Alert only on real state change
+        if new_state != self.current_state and (now - self.last_alert_time) >= STATE_COOLDOWN:
+            self.current_state = new_state
+            self.last_alert_time = now
+            asyncio.create_task(self.send_state_alert(new_state, twi, recent_twi, cvd_30s))
+
+    async def send_state_alert(self, state: str, current_twi: float, recent_twis: list, cvd: float):
+        avg_twi = sum(recent_twis) / len(recent_twis)
+        time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        if state == "LONG":
+            emoji = "🟢"
+            title = "STATE → LONG (Bid Heavy)"
+            reason = "Last 30s of 7s-TWI mostly bid-heavy."
+        else:
+            emoji = "🔴"
+            title = "STATE → SHORT (Ask Heavy + Negative CVD)"
+            reason = "Last 30s of 7s-TWI mostly ask-heavy AND 30s CVD is negative."
+
+        msg = (
+            f"{emoji} <b>{title}</b>\n\n"
+            f"⏰ {time_str}\n"
+            f"• Current 7s TWI: <code>{current_twi:+.3f}</code>\n"
+            f"• 30s Average TWI: <code>{avg_twi:+.3f}</code>\n"
+            f"• 30s CVD: <code>{cvd:+.3f}</code>\n"
+            f"• Best Bid / Ask: <code>{self.best_bid:.1f} / {self.best_ask:.1f}</code>\n"
+            f"• Mid: <code>{self.mid:.1f}</code>\n\n"
+            f"💡 {reason}"
+        )
+        await self.notifier.send(msg)
+        log.info(f"STATE → {state} | 7s TWI={current_twi:+.3f} | 30s CVD={cvd:+.3f}")
 
     async def depth_loop(self):
         while self.running:
             try:
-                log.info(f"Connecting Depth WS → {DEPTH_WS}")
+                log.info("Connecting Depth WS...")
                 async with websockets.connect(DEPTH_WS, ping_interval=20, ping_timeout=10) as ws:
-                    log.info("Depth WebSocket connected")
+                    log.info("Depth connected")
                     async for raw in ws:
                         data = json.loads(raw)
                         payload = data.get("data", {})
-                        bids = [[float(p), float(q)] for p, q in payload.get("b", [])]
-                        asks = [[float(p), float(q)] for p, q in payload.get("a", [])]
-                        now = time.time()
-                        self.snapshots.append((now, bids, asks))
-                        while len(self.snapshots) > 200:
-                            self.snapshots.popleft()
-                        await self.evaluate_and_alert()
+                        self.update_depth(payload.get("b", []), payload.get("a", []))
             except Exception as e:
-                log.error(f"Depth WS error: {e}")
-                await self.notifier.send(f"⚠️ Depth WS disconnected: {e}")
+                log.error(f"Depth error: {e}")
                 await asyncio.sleep(5)
 
     async def trade_loop(self):
         while self.running:
             try:
-                log.info(f"Connecting Trade WS → {TRADE_WS}")
+                log.info("Connecting Trade WS...")
                 async with websockets.connect(TRADE_WS, ping_interval=20, ping_timeout=10) as ws:
-                    log.info("Trade WebSocket connected")
+                    log.info("Trade connected")
                     async for raw in ws:
                         data = json.loads(raw)
                         payload = data.get("data", {})
@@ -259,48 +234,31 @@ class BinanceLOBThermodynamicsEngine:
                         qty = float(payload.get("q", 0))
                         is_buyer_maker = bool(payload.get("m", False))
                         ts = float(payload.get("T", time.time() * 1000)) / 1000.0
-                        self.trades.append((ts, price, qty, is_buyer_maker))
-                        while len(self.trades) > 500:
-                            self.trades.popleft()
+                        self.add_trade(price, qty, is_buyer_maker, ts)
+                        self.update_state(time.time())
             except Exception as e:
-                log.error(f"Trade WS error: {e}")
-                await self.notifier.send(f"⚠️ Trade WS disconnected: {e}")
+                log.error(f"Trade error: {e}")
                 await asyncio.sleep(5)
 
-    async def heartbeat(self):
-        while self.running:
-            await asyncio.sleep(300)
-            raw, z = self._calc_mlofi()
-            temp, ds = self._calc_thermodynamics()
-            msg = (
-                f"<b>🟢 Heartbeat – {self.symbol.upper()} LOB Engine</b>\n"
-                f"• MLOFI Z: {z:.2f}\n"
-                f"• Temperature: {temp:.1f}\n"
-                f"• ΔEntropy: {ds:.3f}\n"
-                f"• Snapshots in window: {len(self.snapshots)}\n"
-                f"• Trades in window: {len(self.trades)}"
-            )
-            await self.notifier.send(msg)
-
     async def start(self):
-        log.info("Starting BTCUSDT LOB Thermodynamics Bot…")
+        log.info("Starting TWI + CVD State Bot...")
         await self.notifier.send(
-            "🚀 <b>BTCUSDT LOB Microstructure + Thermodynamics Bot Online</b>\n"
-            "• Engines: MLOFI (Ridge) + Order-Book Thermodynamics\n"
-            "• Window: 10 s rolling\n"
-            "• Alerts: Edge-triggered + 60 s cooldown"
+            "🚀 <b>BTCUSDT TWI + CVD State Bot Online</b>\n\n"
+            "• 7-second TWI\n"
+            "• 30-second majority vote\n"
+            "• SHORT only when 30s CVD is also negative\n"
+            "• Alerts only on state change\n"
+            "• First 30 seconds = warm-up"
         )
         await asyncio.gather(
             self.depth_loop(),
             self.trade_loop(),
-            self.heartbeat(),
         )
 
 
-# =====================================================================
 if __name__ == "__main__":
-    engine = BinanceLOBThermodynamicsEngine(symbol="btcusdt")
+    bot = TWICVDStateBot()
     try:
-        asyncio.run(engine.start())
+        asyncio.run(bot.start())
     except KeyboardInterrupt:
-        log.info("Bot stopped by user")
+        log.info("Bot stopped")
