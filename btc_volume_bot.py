@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""
+BTCUSDT - HTF candlesticks with a per-candle volume profile drawn
+directly inside each closed box. No 1m clutter, no merged nodes.
+"""
 
 import io
 import time
@@ -19,20 +24,22 @@ CHAT_ID   = "6263967739"
 # -------------------- Config --------------------
 SYMBOL = "BTCUSDT"
 
-HTF_INTERVAL = "1h"        # <- higher timeframe for the boxes/profile. e.g. "1h", "4h", "30min", "15min"
-N_HTF_BOXES = 4           # number of CLOSED HTF candles shown (plus the still-forming one)
+HTF_INTERVAL = "1h"       # higher timeframe for candles/profile: "1h", "4h", "30min", "15min"...
+LOOKBACK_HOURS = 24       # how far back to cover with profiled candles (excludes forming one)
 VALUE_AREA_PCT = 0.68
-VP_ROWS = 30                # rows per per-candle profile (fewer = thicker, cleaner bars)
-PROFILE_WIDTH_FRAC = 0.55   # how far profile bars reach into each box (fraction of box width)
-MIN_TRADES_FOR_PROFILE = 20 # skip drawing a profile if a bucket has too few trades
+VP_ROWS = 30              # price bins per candle's profile
+PROFILE_WIDTH_FRAC = 0.55 # how far profile bars reach across each box (fraction of box width)
+NODE_GAP_FRAC = 0.85      # bar height as fraction of bin height -> leaves a gap, no merging
+MIN_TRADES_FOR_PROFILE = 20
+SHOW_FORMING_CANDLE = True
 
 COLORS = {
     "bull": "#26a69a",
     "bear": "#ef5350",
-    "buy_vol": "#00e676",   # bright green
-    "sell_vol": "#ff1744",  # bright red
-    "poc": "#ffd600",       # gold highlight on the POC row only
-    "val_vah": "#0d47a1",   # dark navy, deliberately muted
+    "buy_vol": "#00e676",
+    "sell_vol": "#ff1744",
+    "poc": "#ffd600",
+    "value_area": "#12212e",   # dim shaded band, no lines
 }
 
 API_CANDIDATES = [
@@ -57,40 +64,53 @@ def _request_json(kind: str, params: dict):
 
 
 def get_time_windows():
-    """
-    current_bucket_start -> start of the still-forming HTF bucket
-    chart_start           -> start of the earliest bucket to display
-    bucket_bounds          -> all buckets (closed + forming) as (start, end)
-    closed_bucket_bounds   -> only the fully closed ones (safe to build a profile for)
-    """
     now = datetime.now(timezone.utc)
     htf_delta = pd.Timedelta(HTF_INTERVAL).to_pytimedelta()
     current_bucket_start = pd.Timestamp(now).floor(HTF_INTERVAL).to_pydatetime()
-    chart_start = current_bucket_start - N_HTF_BOXES * htf_delta
 
-    bucket_bounds = [
+    n_closed = max(1, int(pd.Timedelta(hours=LOOKBACK_HOURS) / htf_delta))
+    chart_start = current_bucket_start - n_closed * htf_delta
+
+    closed_bucket_bounds = [
         (chart_start + i * htf_delta, chart_start + (i + 1) * htf_delta)
-        for i in range(N_HTF_BOXES + 1)  # +1 = the forming bucket
+        for i in range(n_closed)
     ]
-    closed_bucket_bounds = [b for b in bucket_bounds if b[1] <= current_bucket_start]
+    forming_bucket = (current_bucket_start, now)
 
     return {
         "now": now,
         "htf_delta": htf_delta,
         "chart_start": chart_start,
         "current_bucket_start": current_bucket_start,
-        "bucket_bounds": bucket_bounds,
         "closed_bucket_bounds": closed_bucket_bounds,
+        "forming_bucket": forming_bucket,
     }
 
 
 def fetch_1m_klines(start_ms: int, end_ms: int):
-    params = {
-        "symbol": SYMBOL, "interval": "1m",
-        "startTime": start_ms, "endTime": end_ms, "limit": 1000,
-    }
-    data, is_futures = _request_json("klines", params)
-    df = pd.DataFrame(data, columns=[
+    """Paginated: needed since LOOKBACK_HOURS worth of 1m candles can exceed 1000."""
+    frames = []
+    cursor = start_ms
+    is_futures = True
+    while cursor < end_ms:
+        params = {
+            "symbol": SYMBOL, "interval": "1m",
+            "startTime": cursor, "endTime": end_ms, "limit": 1000,
+        }
+        data, is_futures = _request_json("klines", params)
+        if not data:
+            break
+        frames.extend(data)
+        last_open = int(data[-1][0])
+        cursor = last_open + 60_000
+        if len(data) < 1000:
+            break
+        time.sleep(0.04)
+
+    if not frames:
+        raise ValueError("No klines returned")
+
+    df = pd.DataFrame(frames, columns=[
         "open_time", "open", "high", "low", "close", "volume",
         "close_time", "quote_vol", "trades", "taker_buy_base",
         "taker_buy_quote", "ignore"
@@ -98,7 +118,8 @@ def fetch_1m_klines(start_ms: int, end_ms: int):
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = df[c].astype(float)
-    df = df.set_index("open_time")
+    df = df.set_index("open_time").sort_index()
+    df = df[~df.index.duplicated(keep="first")]
     return df[["open", "high", "low", "close", "volume"]], is_futures
 
 
@@ -123,10 +144,10 @@ def fetch_agg_trades(start_ms: int, end_ms: int) -> pd.DataFrame:
         if last["T"] >= end_ms or len(batch) < 1000:
             break
         from_id = last["a"] + 1
-        time.sleep(0.05)
+        time.sleep(0.04)
 
     if not all_trades:
-        raise ValueError("No trades")
+        return pd.DataFrame(columns=["price", "qty", "T", "is_buyer_maker"])
 
     df = pd.DataFrame(all_trades)
     df["price"] = df["p"].astype(float)
@@ -134,7 +155,7 @@ def fetch_agg_trades(start_ms: int, end_ms: int) -> pd.DataFrame:
     df["T"] = df["T"].astype(int)
     df["is_buyer_maker"] = df["m"].astype(bool)
     df = df[(df["T"] >= start_ms) & (df["T"] <= end_ms)]
-    return df
+    return df[["price", "qty", "T", "is_buyer_maker"]]
 
 
 def build_volume_profile(trades: pd.DataFrame, n_rows: int = VP_ROWS):
@@ -147,7 +168,6 @@ def build_volume_profile(trades: pd.DataFrame, n_rows: int = VP_ROWS):
         p_max = p_min + 1.0
 
     edges = np.linspace(p_min, p_max, n_rows + 1)
-    centers = (edges[:-1] + edges[1:]) / 2
     height = edges[1] - edges[0]
 
     total = np.zeros(n_rows)
@@ -163,7 +183,7 @@ def build_volume_profile(trades: pd.DataFrame, n_rows: int = VP_ROWS):
             buy[i] += q
 
     poc_idx = int(np.argmax(total))
-    poc_price = centers[poc_idx]
+    poc_price = (edges[poc_idx] + edges[poc_idx + 1]) / 2
 
     target = total.sum() * VALUE_AREA_PCT
     order = np.argsort(total)[::-1]
@@ -185,15 +205,15 @@ def build_volume_profile(trades: pd.DataFrame, n_rows: int = VP_ROWS):
     }
 
 
-def build_bucket_profiles(trades: pd.DataFrame, closed_bucket_bounds):
+def build_bucket_profiles(closed_bucket_bounds):
+    """Fetches trades and builds a profile separately for each closed bucket."""
     profiles = {}
-    t_ms = trades["T"].values
     for start, end in closed_bucket_bounds:
         s_ms = int(start.timestamp() * 1000)
-        e_ms = int(end.timestamp() * 1000)
-        sub = trades[(t_ms >= s_ms) & (t_ms < e_ms)]
-        if len(sub) >= MIN_TRADES_FOR_PROFILE:
-            profiles[start] = build_volume_profile(sub, VP_ROWS)
+        e_ms = int(end.timestamp() * 1000) - 1
+        trades = fetch_agg_trades(s_ms, e_ms)
+        if len(trades) >= MIN_TRADES_FOR_PROFILE:
+            profiles[start] = build_volume_profile(trades, VP_ROWS)
     return profiles
 
 
@@ -203,88 +223,97 @@ def get_htf_candles(df_1m: pd.DataFrame):
     }).dropna()
 
 
-def plot_chart(df_1m, htf, bucket_profiles, windows, market_label):
+def plot_chart(htf, bucket_profiles, windows, market_label):
     fig, ax = plt.subplots(figsize=(16, 9), facecolor="#0d0d0d")
     ax.set_facecolor("#0d0d0d")
     for sp in ax.spines.values():
         sp.set_color("#333")
 
-    # ---- 1m candlesticks ----
-    w = 0.00055
-    for ts, row in df_1m.iterrows():
-        o, h, l, c = row.open, row.high, row.low, row.close
-        color = COLORS["bull"] if c >= o else COLORS["bear"]
-        ax.plot([ts, ts], [l, h], color=color, lw=0.9, solid_capstyle="round", zorder=4)
-        body_h = abs(c - o) or (h - l) * 0.04 or 0.5
-        ax.add_patch(Rectangle(
-            (mdates.date2num(ts) - w / 2, min(o, c)), w, body_h,
-            facecolor=color, edgecolor=color, lw=0.5, alpha=0.95, zorder=5
-        ))
-
     htf_delta = windows["htf_delta"]
     box_width_num = mdates.date2num(windows["chart_start"] + htf_delta) - mdates.date2num(windows["chart_start"])
+    current_bucket_start = windows["current_bucket_start"]
 
-    # ---- HTF boxes + per-candle volume profile ----
     for ts, row in htf.iterrows():
-        start_num = mdates.date2num(ts)
-        end_num = mdates.date2num(ts + htf_delta)
-        bullish = row.close >= row.open
-        body_color = COLORS["bull"] if bullish else COLORS["bear"]
+        is_forming = ts == current_bucket_start
+        if is_forming and not SHOW_FORMING_CANDLE:
+            continue
 
-        # thin high-low outline (unfilled - no heavy background wash)
+        start_num = mdates.date2num(ts)
+        end_num = start_num + box_width_num
+        mid_num = (start_num + end_num) / 2
+        o, h, l, c = row.open, row.high, row.low, row.close
+        bullish = c >= o
+        body_color = COLORS["bull"] if bullish else COLORS["bear"]
+        candle_alpha = 0.45 if is_forming else 1.0
+
+        # wick
+        ax.plot([mid_num, mid_num], [l, h], color=body_color, lw=1.4,
+                alpha=candle_alpha, solid_capstyle="round", zorder=6)
+        # body
+        body_low = min(o, c)
+        body_h = abs(c - o) or (h - l) * 0.02 or 0.5
+        body_w = box_width_num * 0.42
         ax.add_patch(Rectangle(
-            (start_num, row.low), end_num - start_num, row.high - row.low,
-            facecolor="none", edgecolor=body_color, lw=0.8, alpha=0.35, zorder=1
+            (mid_num - body_w / 2, body_low), body_w, body_h,
+            facecolor=body_color, edgecolor=body_color, lw=1.0,
+            alpha=candle_alpha, zorder=6,
+            linestyle="--" if is_forming else "-",
+            fill=not is_forming,
         ))
-        # open-close body
-        body_low = min(row.open, row.close)
-        body_h = abs(row.close - row.open) or (row.high - row.low) * 0.08
-        ax.add_patch(Rectangle(
-            (start_num, body_low), end_num - start_num, body_h,
-            facecolor=body_color, edgecolor=body_color, lw=1.2, alpha=0.15, zorder=2
-        ))
+
+        if is_forming:
+            continue  # no profile for the still-forming candle
 
         vp = bucket_profiles.get(ts)
         if vp is None:
             continue
 
+        # dim value-area shading, no lines
+        ax.add_patch(Rectangle(
+            (start_num, vp["val"]), box_width_num, vp["vah"] - vp["val"],
+            facecolor=COLORS["value_area"], edgecolor="none", alpha=0.55, zorder=2
+        ))
+
         max_vol = vp["total"].max() or 1.0
         max_bar = box_width_num * PROFILE_WIDTH_FRAC
-        for i, (edge_low, buy, sell, total) in enumerate(
-            zip(vp["edges"][:-1], vp["buy"], vp["sell"], vp["total"])
-        ):
-            if total <= 0:
+        gap = vp["height"] * (1 - NODE_GAP_FRAC) / 2
+
+        for i, edge_low in enumerate(vp["edges"][:-1]):
+            total_i = vp["total"][i]
+            if total_i <= 0:
                 continue
-            sell_w = sell / max_vol * max_bar
-            buy_w = buy / max_vol * max_bar
+            buy_i, sell_i = vp["buy"][i], vp["sell"][i]
+            row_low = edge_low + gap
+            row_h = vp["height"] * NODE_GAP_FRAC
+
+            sell_w = sell_i / max_vol * max_bar
+            buy_w = buy_i / max_vol * max_bar
+
             if sell_w > 0:
                 ax.add_patch(Rectangle(
-                    (end_num - sell_w, edge_low), sell_w, vp["height"],
-                    facecolor=COLORS["sell_vol"], edgecolor="none", alpha=0.55, zorder=3
+                    (start_num, row_low), sell_w, row_h,
+                    facecolor=COLORS["sell_vol"], edgecolor="none", alpha=0.85, zorder=3
                 ))
             if buy_w > 0:
                 ax.add_patch(Rectangle(
-                    (end_num - sell_w - buy_w, edge_low), buy_w, vp["height"],
-                    facecolor=COLORS["buy_vol"], edgecolor="none", alpha=0.55, zorder=3
+                    (start_num + sell_w, row_low), buy_w, row_h,
+                    facecolor=COLORS["buy_vol"], edgecolor="none", alpha=0.85, zorder=3
                 ))
             if i == vp["poc_idx"]:
                 ax.add_patch(Rectangle(
-                    (end_num - sell_w - buy_w, edge_low), sell_w + buy_w, vp["height"],
-                    facecolor=COLORS["poc"], edgecolor="none", alpha=0.30, zorder=3.5
+                    (start_num, row_low), sell_w + buy_w, row_h,
+                    facecolor=COLORS["poc"], edgecolor="none", alpha=0.35, zorder=3.5
                 ))
-
-        # VAL / VAH - darker, confined to this box only
-        ax.hlines(vp["val"], start_num, end_num, colors=COLORS["val_vah"], lw=1.1, ls="--", alpha=0.9, zorder=4)
-        ax.hlines(vp["vah"], start_num, end_num, colors=COLORS["val_vah"], lw=1.1, ls="--", alpha=0.9, zorder=4)
 
     ax.set_ylabel("Price (USDT)", color="#ccc", fontsize=10)
     ax.tick_params(colors="#aaa", labelsize=8)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=timezone.utc))
     ax.grid(True, color="#1a1a1a", ls="--", lw=0.5)
 
-    title = (f"{market_label}  |  1m Chart + {HTF_INTERVAL} HTF Boxes & Volume Profile "
-             f"(VA {int(VALUE_AREA_PCT * 100)}%)")
-    ax.set_title(title, color="#fff", fontsize=11, pad=9)
+    ax.set_title(
+        f"{market_label}  |  {HTF_INTERVAL} Candles + Volume Profile (VA {int(VALUE_AREA_PCT*100)}%)",
+        color="#fff", fontsize=11, pad=9
+    )
 
     closed = windows["closed_bucket_bounds"]
     last_closed = closed[-1][0] if closed else None
@@ -316,11 +345,13 @@ def send_telegram(photo: bytes, caption: str):
 def main():
     print("Calculating time windows ...")
     w = get_time_windows()
+    print(f"Covering {len(w['closed_bucket_bounds'])} closed {HTF_INTERVAL} candles "
+          f"({w['chart_start']} -> {w['current_bucket_start']}) + forming candle")
 
     start_ms = int(w["chart_start"].timestamp() * 1000)
     end_ms = int(w["now"].timestamp() * 1000)
 
-    print("Fetching 1m candles ...")
+    print("Fetching 1m candles for OHLC resampling ...")
     df_1m, is_futures = fetch_1m_klines(start_ms, end_ms)
     market = "BTCUSDT.P" if is_futures else "BTCUSDT (Spot)"
     print(f"Got {len(df_1m)} x 1m candles [{market}]")
@@ -328,31 +359,24 @@ def main():
     htf = get_htf_candles(df_1m)
     print(f"HTF {HTF_INTERVAL} candles: {len(htf)}")
 
-    trades_start_ms = int(w["chart_start"].timestamp() * 1000)
-    trades_end_ms = int(w["current_bucket_start"].timestamp() * 1000) - 1
-
-    print("Fetching trade tape for closed HTF buckets ...")
-    trades = fetch_agg_trades(trades_start_ms, trades_end_ms)
-    print(f"Trades: {len(trades)}")
-
-    print("Building per-candle volume profiles ...")
-    bucket_profiles = build_bucket_profiles(trades, w["closed_bucket_bounds"])
-    print(f"Profiles built for {len(bucket_profiles)} / {len(w['closed_bucket_bounds'])} closed buckets")
+    print("Building volume profile for every closed candle (this hits the API once per candle) ...")
+    bucket_profiles = build_bucket_profiles(w["closed_bucket_bounds"])
+    print(f"Profiles built for {len(bucket_profiles)} / {len(w['closed_bucket_bounds'])} closed candles")
 
     print("Rendering ...")
-    img = plot_chart(df_1m, htf, bucket_profiles, w, market)
+    img = plot_chart(htf, bucket_profiles, w, market)
 
     closed = w["closed_bucket_bounds"]
     last_closed = closed[-1][0] if closed else None
     if last_closed in bucket_profiles:
         vp = bucket_profiles[last_closed]
         caption = (
-            f"{market} | 1m + {HTF_INTERVAL} HTF Boxes & Volume Profile (VA {int(VALUE_AREA_PCT*100)}%)\n"
-            f"Last closed {HTF_INTERVAL}: {last_closed.strftime('%H:%M')} UTC\n"
+            f"{market} | {HTF_INTERVAL} Candles + Volume Profile (VA {int(VALUE_AREA_PCT*100)}%)\n"
+            f"Covering {len(bucket_profiles)} closed candles, last: {last_closed.strftime('%H:%M')} UTC\n"
             f"POC {vp['poc_price']:.1f} | VAH {vp['vah']:.1f} | VAL {vp['val']:.1f}"
         )
     else:
-        caption = f"{market} | 1m + {HTF_INTERVAL} HTF Boxes & Volume Profile"
+        caption = f"{market} | {HTF_INTERVAL} Candles + Volume Profile"
 
     send_telegram(img, caption)
     print("Done.")
