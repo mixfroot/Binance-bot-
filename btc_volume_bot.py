@@ -1,368 +1,333 @@
 #!/usr/bin/env python3
 """
-BTCUSDT - 1m candlesticks with a per-1H (or other HTF) volume profile
-drawn inside each closed bucket, anchored to the left edge. No HTF
-candles are drawn - just thin boundary lines marking each bucket.
+24/7 Binance Perpetual Futures Mover Bot
+---------------------------------------
+- Selects coins with 24h volume >= $60 Million
+- Keeps Top 16 by volume
+- Every 15 minutes:
+    • Updates Top 16
+    • Checks just-closed 15m candle for ±1% move
+    • Sends ranked alerts (highest volume first)
+    • Sends Heartbeat
+    • Reports any errors that occurred in the cycle
+- Fully self-healing with retries
 """
 
-import io
 import time
-from datetime import datetime, timezone
+import traceback
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Optional
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import numpy as np
-import pandas as pd
 import requests
-from matplotlib.patches import Rectangle
 
-# -------------------- Telegram --------------------
+# ===================== CONFIG =====================
 BOT_TOKEN = "7541584197:AAGZuuVygk54j3P6p_pcXZzplXEmQSpT7bs"
 CHAT_ID   = "6263967739"
 
-# -------------------- Config --------------------
-SYMBOL = "BTCUSDT"
+MIN_VOLUME_USDT = 60_000_000          # $60 Million
+TOP_N = 16
+MOVE_THRESHOLD = 1.0                  # ±1%
+TIMEFRAME = "15m"
+CYCLE_SECONDS = 15 * 60               # 15 minutes
 
-HTF_INTERVAL = "1h"        # bucket size the profile is built on: "1h", "4h", "30min", ...
-LOOKBACK_HOURS = 24        # how far back to cover with profiled buckets (excludes forming one)
-VALUE_AREA_PCT = 0.68
-VP_ROWS = 30                # price bins per bucket's profile
-PROFILE_WIDTH_FRAC = 0.55   # how far profile bars reach across each bucket (fraction of bucket width)
-NODE_GAP_FRAC = 0.85        # bar height as fraction of bin height -> leaves a gap, no merging
-MIN_TRADES_FOR_PROFILE = 20
-SHOW_FORMING_BUCKET_LINE = True   # just a marker line for the still-forming bucket, no profile
-
-COLORS = {
-    "bull": "#26a69a",
-    "bear": "#ef5350",
-    "buy_vol": "#00e676",
-    "sell_vol": "#ff1744",
-    "poc": "#ffd600",
-    "value_area": "#12212e",   # dim shaded band, no lines
-    "bucket_edge": "#555",     # thin boundary marker between buckets
-}
-
-API_CANDIDATES = [
-    ("https://fapi.binance.com", True,  "/fapi/v1/klines", "/fapi/v1/aggTrades"),
-    ("https://fapi1.binance.com", True, "/fapi/v1/klines", "/fapi/v1/aggTrades"),
-    ("https://data-api.binance.vision", False, "/api/v3/klines", "/api/v3/aggTrades"),
+# API endpoints (Futures preferred, fallback to vision)
+FAPI_BASES = [
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
 ]
+VISION = "https://data-api.binance.vision"
+
+MAX_RETRIES = 4
+RETRY_DELAY = 3
 
 
-def _request_json(kind: str, params: dict):
-    last_err = None
-    for base, is_futures, kpath, tpath in API_CANDIDATES:
-        url = base + (kpath if kind == "klines" else tpath)
+# ===================== TELEGRAM =====================
+def send_telegram(text: str, silent: bool = False) -> bool:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_notification": silent,
+    }
+    for attempt in range(3):
         try:
-            r = requests.get(url, params=params, timeout=25)
+            r = requests.post(url, json=payload, timeout=15)
             if r.status_code == 200:
-                return r.json(), is_futures
-            last_err = f"{r.status_code} from {url}"
-        except Exception as e:
-            last_err = str(e)
-    raise RuntimeError(f"All endpoints failed: {last_err}")
-
-
-def get_time_windows():
-    now = datetime.now(timezone.utc)
-    htf_delta = pd.Timedelta(HTF_INTERVAL).to_pytimedelta()
-    current_bucket_start = pd.Timestamp(now).floor(HTF_INTERVAL).to_pydatetime()
-
-    n_closed = max(1, int(pd.Timedelta(hours=LOOKBACK_HOURS) / htf_delta))
-    chart_start = current_bucket_start - n_closed * htf_delta
-
-    closed_bucket_bounds = [
-        (chart_start + i * htf_delta, chart_start + (i + 1) * htf_delta)
-        for i in range(n_closed)
-    ]
-
-    return {
-        "now": now,
-        "htf_delta": htf_delta,
-        "chart_start": chart_start,
-        "current_bucket_start": current_bucket_start,
-        "closed_bucket_bounds": closed_bucket_bounds,
-    }
-
-
-def fetch_1m_klines(start_ms: int, end_ms: int):
-    """Paginated: LOOKBACK_HOURS worth of 1m candles can exceed 1000 rows."""
-    frames = []
-    cursor = start_ms
-    is_futures = True
-    while cursor < end_ms:
-        params = {
-            "symbol": SYMBOL, "interval": "1m",
-            "startTime": cursor, "endTime": end_ms, "limit": 1000,
-        }
-        data, is_futures = _request_json("klines", params)
-        if not data:
-            break
-        frames.extend(data)
-        last_open = int(data[-1][0])
-        cursor = last_open + 60_000
-        if len(data) < 1000:
-            break
-        time.sleep(0.04)
-
-    if not frames:
-        raise ValueError("No klines returned")
-
-    df = pd.DataFrame(frames, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_vol", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore"
-    ])
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = df[c].astype(float)
-    df = df.set_index("open_time").sort_index()
-    df = df[~df.index.duplicated(keep="first")]
-    return df[["open", "high", "low", "close", "volume"]], is_futures
-
-
-def fetch_agg_trades(start_ms: int, end_ms: int) -> pd.DataFrame:
-    all_trades = []
-    from_id = None
-    for _ in range(400):
-        params = {"symbol": SYMBOL, "limit": 1000}
-        if from_id is None:
-            params["startTime"] = start_ms
-            params["endTime"] = end_ms
-        else:
-            params["fromId"] = from_id
-        try:
-            batch, _ = _request_json("aggTrades", params)
+                return True
         except Exception:
-            break
-        if not batch:
-            break
-        all_trades.extend(batch)
-        last = batch[-1]
-        if last["T"] >= end_ms or len(batch) < 1000:
-            break
-        from_id = last["a"] + 1
-        time.sleep(0.04)
-
-    if not all_trades:
-        return pd.DataFrame(columns=["price", "qty", "T", "is_buyer_maker"])
-
-    df = pd.DataFrame(all_trades)
-    df["price"] = df["p"].astype(float)
-    df["qty"] = df["q"].astype(float)
-    df["T"] = df["T"].astype(int)
-    df["is_buyer_maker"] = df["m"].astype(bool)
-    df = df[(df["T"] >= start_ms) & (df["T"] <= end_ms)]
-    return df[["price", "qty", "T", "is_buyer_maker"]]
+            time.sleep(2)
+    return False
 
 
-def build_volume_profile(trades: pd.DataFrame, n_rows: int = VP_ROWS):
-    prices = trades["price"].values
-    qtys = trades["qty"].values
-    is_bm = trades["is_buyer_maker"].values
+# ===================== HTTP HELPERS =====================
+def safe_get(url: str, params: dict = None, timeout: int = 12) -> Optional[dict | list]:
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (418, 429):  # rate limit / ban
+                time.sleep(RETRY_DELAY * (attempt + 2))
+            else:
+                time.sleep(RETRY_DELAY)
+        except Exception:
+            time.sleep(RETRY_DELAY)
+    return None
 
-    p_min, p_max = prices.min(), prices.max()
-    if p_max <= p_min:
-        p_max = p_min + 1.0
 
-    edges = np.linspace(p_min, p_max, n_rows + 1)
-    height = edges[1] - edges[0]
+def get_24h_tickers() -> List[dict]:
+    """Return all USDT perpetual tickers with volume."""
+    for base in FAPI_BASES:
+        data = safe_get(f"{base}/fapi/v1/ticker/24hr")
+        if data and isinstance(data, list):
+            return data
+    # fallback (spot style – less ideal but better than nothing)
+    data = safe_get(f"{VISION}/api/v3/ticker/24hr")
+    if data and isinstance(data, list):
+        return data
+    return []
 
-    total = np.zeros(n_rows)
-    buy = np.zeros(n_rows)
-    sell = np.zeros(n_rows)
 
-    idxs = np.clip(np.digitize(prices, edges) - 1, 0, n_rows - 1)
-    for i, q, maker in zip(idxs, qtys, is_bm):
-        total[i] += q
-        if maker:
-            sell[i] += q
-        else:
-            buy[i] += q
-
-    poc_idx = int(np.argmax(total))
-    poc_price = (edges[poc_idx] + edges[poc_idx + 1]) / 2
-
-    target = total.sum() * VALUE_AREA_PCT
-    order = np.argsort(total)[::-1]
-    cum = 0.0
-    va_idx = []
-    for idx in order:
-        cum += total[idx]
-        va_idx.append(idx)
-        if cum >= target:
-            break
-    va_idx = sorted(va_idx)
-    val = edges[va_idx[0]]
-    vah = edges[va_idx[-1] + 1]
-
-    return {
-        "edges": edges, "height": height, "total": total, "buy": buy, "sell": sell,
-        "poc_price": poc_price, "poc_idx": poc_idx, "vah": vah, "val": val,
-        "total_volume": float(total.sum()),
+def get_closed_15m_candle(symbol: str) -> Optional[dict]:
+    """
+    Fetch the most recently closed 15m candle.
+    We request last 3 candles and pick the one that is fully closed.
+    """
+    params = {
+        "symbol": symbol,
+        "interval": TIMEFRAME,
+        "limit": 3,
     }
+    for base in FAPI_BASES:
+        data = safe_get(f"{base}/fapi/v1/klines", params)
+        if data and len(data) >= 2:
+            # data[-1] is current forming, data[-2] is last closed
+            c = data[-2]
+            return {
+                "open_time": int(c[0]),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "volume": float(c[5]),
+                "close_time": int(c[6]),
+            }
+    # vision fallback
+    data = safe_get(f"{VISION}/api/v3/klines", params)
+    if data and len(data) >= 2:
+        c = data[-2]
+        return {
+            "open_time": int(c[0]),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
+            "close_time": int(c[6]),
+        }
+    return None
 
 
-def build_bucket_profiles(closed_bucket_bounds):
-    profiles = {}
-    for start, end in closed_bucket_bounds:
-        s_ms = int(start.timestamp() * 1000)
-        e_ms = int(end.timestamp() * 1000) - 1
-        trades = fetch_agg_trades(s_ms, e_ms)
-        if len(trades) >= MIN_TRADES_FOR_PROFILE:
-            profiles[start] = build_volume_profile(trades, VP_ROWS)
-    return profiles
+# ===================== CORE LOGIC =====================
+def select_top_coins() -> List[dict]:
+    """
+    Returns list of dicts sorted by quoteVolume desc:
+    [{"symbol": "BTCUSDT", "volume": 123456789.0}, ...]
+    Only volume >= MIN_VOLUME_USDT, max TOP_N.
+    """
+    tickers = get_24h_tickers()
+    if not tickers:
+        return []
 
-
-def plot_chart(df_1m, bucket_profiles, windows, market_label):
-    fig, ax = plt.subplots(figsize=(16, 9), facecolor="#0d0d0d")
-    ax.set_facecolor("#0d0d0d")
-    for sp in ax.spines.values():
-        sp.set_color("#333")
-
-    # ---- 1m candlesticks (the only candles drawn) ----
-    w = 0.00055
-    for ts, row in df_1m.iterrows():
-        o, h, l, c = row.open, row.high, row.low, row.close
-        color = COLORS["bull"] if c >= o else COLORS["bear"]
-        ax.plot([ts, ts], [l, h], color=color, lw=0.9, solid_capstyle="round", zorder=6)
-        body_h = abs(c - o) or (h - l) * 0.04 or 0.5
-        ax.add_patch(Rectangle(
-            (mdates.date2num(ts) - w / 2, min(o, c)), w, body_h,
-            facecolor=color, edgecolor=color, lw=0.5, alpha=0.95, zorder=6
-        ))
-
-    htf_delta = windows["htf_delta"]
-    bucket_width_num = mdates.date2num(windows["chart_start"] + htf_delta) - mdates.date2num(windows["chart_start"])
-    current_bucket_start = windows["current_bucket_start"]
-
-    # ---- bucket boundary markers + per-bucket volume profile ----
-    for start, end in windows["closed_bucket_bounds"]:
-        start_num = mdates.date2num(start)
-        end_num = mdates.date2num(end)
-
-        ax.axvline(start_num, color=COLORS["bucket_edge"], lw=0.6, alpha=0.4, zorder=1)
-
-        vp = bucket_profiles.get(start)
-        if vp is None:
+    candidates = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
             continue
+        # skip some leveraged tokens if needed
+        if any(x in sym for x in ["UP", "DOWN", "BULL", "BEAR"]):
+            continue
+        try:
+            vol = float(t.get("quoteVolume", 0))
+        except Exception:
+            continue
+        if vol >= MIN_VOLUME_USDT:
+            candidates.append({"symbol": sym, "volume": vol})
 
-        # dim value-area shading, no lines
-        ax.add_patch(Rectangle(
-            (start_num, vp["val"]), bucket_width_num, vp["vah"] - vp["val"],
-            facecolor=COLORS["value_area"], edgecolor="none", alpha=0.55, zorder=2
-        ))
+    candidates.sort(key=lambda x: x["volume"], reverse=True)
+    return candidates[:TOP_N]
 
-        max_vol = vp["total"].max() or 1.0
-        max_bar = bucket_width_num * PROFILE_WIDTH_FRAC
-        gap = vp["height"] * (1 - NODE_GAP_FRAC) / 2
 
-        for i, edge_low in enumerate(vp["edges"][:-1]):
-            total_i = vp["total"][i]
-            if total_i <= 0:
-                continue
-            buy_i, sell_i = vp["buy"][i], vp["sell"][i]
-            row_low = edge_low + gap
-            row_h = vp["height"] * NODE_GAP_FRAC
+def check_moves(coins: List[dict]) -> List[dict]:
+    """
+    For each coin check last closed 15m candle.
+    Return list of movers with % change, sorted by volume desc.
+    """
+    movers = []
+    for coin in coins:
+        sym = coin["symbol"]
+        candle = get_closed_15m_candle(sym)
+        if not candle:
+            continue
+        o = candle["open"]
+        c = candle["close"]
+        if o <= 0:
+            continue
+        pct = ((c - o) / o) * 100.0
+        if abs(pct) >= MOVE_THRESHOLD:
+            movers.append({
+                "symbol": sym,
+                "volume": coin["volume"],
+                "pct": pct,
+                "open": o,
+                "close": c,
+                "direction": "🟢 LONG" if pct > 0 else "🔴 SHORT",
+            })
+        time.sleep(0.08)  # gentle on API
 
-            # anchored to the LEFT edge of the bucket, growing rightward
-            sell_w = sell_i / max_vol * max_bar
-            buy_w = buy_i / max_vol * max_bar
+    movers.sort(key=lambda x: x["volume"], reverse=True)
+    return movers
 
-            if sell_w > 0:
-                ax.add_patch(Rectangle(
-                    (start_num, row_low), sell_w, row_h,
-                    facecolor=COLORS["sell_vol"], edgecolor="none", alpha=0.85, zorder=3
-                ))
-            if buy_w > 0:
-                ax.add_patch(Rectangle(
-                    (start_num + sell_w, row_low), buy_w, row_h,
-                    facecolor=COLORS["buy_vol"], edgecolor="none", alpha=0.85, zorder=3
-                ))
-            if i == vp["poc_idx"]:
-                ax.add_patch(Rectangle(
-                    (start_num, row_low), sell_w + buy_w, row_h,
-                    facecolor=COLORS["poc"], edgecolor="none", alpha=0.35, zorder=3.5
-                ))
 
-    if SHOW_FORMING_BUCKET_LINE:
-        ax.axvline(mdates.date2num(current_bucket_start), color=COLORS["bucket_edge"],
-                    lw=0.8, alpha=0.6, ls="--", zorder=1)
+def format_volume(v: float) -> str:
+    if v >= 1_000_000_000:
+        return f"${v/1_000_000_000:.2f}B"
+    return f"${v/1_000_000:.1f}M"
 
-    ax.set_ylabel("Price (USDT)", color="#ccc", fontsize=10)
-    ax.tick_params(colors="#aaa", labelsize=8)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=timezone.utc))
-    ax.grid(True, color="#1a1a1a", ls="--", lw=0.5)
 
-    ax.set_title(
-        f"{market_label}  |  1m Candles + {HTF_INTERVAL} Volume Profile (VA {int(VALUE_AREA_PCT*100)}%)",
-        color="#fff", fontsize=11, pad=9
+def build_alert(movers: List[dict], top_coins: List[dict], errors: List[str]) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"<b>⚡ 15m Mover Alert</b>  |  {now}", ""]
+
+    if movers:
+        lines.append(f"<b>Moved ≥ {MOVE_THRESHOLD}%  ({len(movers)} coins)</b>")
+        for i, m in enumerate(movers, 1):
+            lines.append(
+                f"{i}. <b>{m['symbol']}</b>  {m['direction']}  "
+                f"<b>{m['pct']:+.2f}%</b>  |  Vol {format_volume(m['volume'])}"
+            )
+        lines.append("")
+    else:
+        lines.append(f"No coin moved ≥ {MOVE_THRESHOLD}% this candle.")
+        lines.append("")
+
+    # Top 16 snapshot (short)
+    lines.append(f"<b>Top {len(top_coins)} by Volume (≥$60M)</b>")
+    for i, c in enumerate(top_coins[:8], 1):  # show first 8 to keep message short
+        lines.append(f"{i}. {c['symbol']}  {format_volume(c['volume'])}")
+    if len(top_coins) > 8:
+        lines.append(f"... +{len(top_coins)-8} more")
+
+    if errors:
+        lines.append("")
+        lines.append("<b>⚠️ Errors in this cycle:</b>")
+        for e in errors[:5]:
+            lines.append(f"• {e}")
+
+    return "\n".join(lines)
+
+
+def build_heartbeat(top_coins: List[dict], errors: List[str]) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    status = "✅ OK" if not errors else "⚠️ HAD ERRORS"
+    text = (
+        f"<b>Heartbeat</b>  |  {now}\n"
+        f"Status: {status}\n"
+        f"Watching: {len(top_coins)} coins\n"
+        f"Next check in \~15 min"
     )
-
-    closed = windows["closed_bucket_bounds"]
-    last_closed = closed[-1][0] if closed else None
-    if last_closed is not None and last_closed in bucket_profiles:
-        vp = bucket_profiles[last_closed]
-        info = (f"Last closed {HTF_INTERVAL}  ->  POC {vp['poc_price']:.1f}   "
-                f"VAH {vp['vah']:.1f}   VAL {vp['val']:.1f}   "
-                f"Total {vp['total_volume']:.1f} BTC   |   "
-                f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
-        fig.text(0.5, 0.012, info, ha="center", color="#aaa", fontsize=9, family="monospace")
-
-    plt.tight_layout(rect=[0, 0.03, 1, 1])
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
+    if errors:
+        text += "\n\nErrors:\n" + "\n".join(f"• {e}" for e in errors[:3])
+    return text
 
 
-def send_telegram(photo: bytes, caption: str):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("btc_1m_vp.png", photo, "image/png")}
-    data = {"chat_id": CHAT_ID, "caption": caption}
-    r = requests.post(url, data=data, files=files, timeout=60)
-    r.raise_for_status()
-    print("Telegram OK:", r.json().get("ok"))
+# ===================== MAIN LOOP =====================
+def wait_until_next_cycle():
+    """
+    Sleep until the next clean 15-minute boundary + 8 seconds buffer
+    (so the candle is fully closed on Binance side).
+    """
+    now = datetime.now(timezone.utc)
+    # next 15-min mark
+    minute = (now.minute // 15 + 1) * 15
+    if minute >= 60:
+        next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    else:
+        next_time = now.replace(minute=minute, second=0, microsecond=0)
+
+    # small buffer so candle is closed
+    next_time += timedelta(seconds=8)
+
+    sleep_sec = (next_time - datetime.now(timezone.utc)).total_seconds()
+    if sleep_sec < 5:
+        sleep_sec += CYCLE_SECONDS
+    print(f"Sleeping {sleep_sec:.0f}s until next cycle ({next_time}) ...")
+    time.sleep(max(5, sleep_sec))
+
+
+def run_cycle() -> None:
+    errors = []
+    top_coins = []
+    movers = []
+
+    try:
+        print(f"\n[{datetime.now(timezone.utc)}] Starting cycle ...")
+        top_coins = select_top_coins()
+        if not top_coins:
+            errors.append("Could not fetch any high-volume coins")
+        else:
+            print(f"Top {len(top_coins)} coins selected")
+            movers = check_moves(top_coins)
+            print(f"Movers found: {len(movers)}")
+    except Exception as e:
+        err = f"Cycle error: {type(e).__name__}: {e}"
+        errors.append(err)
+        print(err)
+        traceback.print_exc()
+
+    # Alerts
+    try:
+        if movers or errors:
+            alert = build_alert(movers, top_coins, errors)
+            send_telegram(alert)
+        # Always send heartbeat
+        hb = build_heartbeat(top_coins, errors)
+        send_telegram(hb, silent=True)
+    except Exception as e:
+        print("Telegram send failed:", e)
 
 
 def main():
-    print("Calculating time windows ...")
-    w = get_time_windows()
-    print(f"Covering {len(w['closed_bucket_bounds'])} closed {HTF_INTERVAL} buckets "
-          f"({w['chart_start']} -> {w['current_bucket_start']}) for the profile")
+    print("=" * 60)
+    print("Volume Mover Bot started")
+    print(f"Min Volume : ${MIN_VOLUME_USDT/1e6:.0f}M")
+    print(f"Top N      : {TOP_N}")
+    print(f"Move       : ±{MOVE_THRESHOLD}% on {TIMEFRAME}")
+    print("=" * 60)
 
-    start_ms = int(w["chart_start"].timestamp() * 1000)
-    end_ms = int(w["now"].timestamp() * 1000)
+    send_telegram(
+        f"<b>Bot Started</b>\n"
+        f"Watching Perpetual Futures\n"
+        f"Volume ≥ ${MIN_VOLUME_USDT/1e6:.0f}M → Top {TOP_N}\n"
+        f"Alert on ±{MOVE_THRESHOLD}% 15m close\n"
+        f"Heartbeat every 15 min"
+    )
 
-    print("Fetching 1m candles ...")
-    df_1m, is_futures = fetch_1m_klines(start_ms, end_ms)
-    market = "BTCUSDT.P" if is_futures else "BTCUSDT (Spot)"
-    print(f"Got {len(df_1m)} x 1m candles [{market}]")
+    # First run after short delay
+    time.sleep(5)
 
-    print("Building volume profile for every closed bucket (one tape fetch per bucket) ...")
-    bucket_profiles = build_bucket_profiles(w["closed_bucket_bounds"])
-    print(f"Profiles built for {len(bucket_profiles)} / {len(w['closed_bucket_bounds'])} closed buckets")
+    while True:
+        try:
+            run_cycle()
+        except Exception as e:
+            msg = f"Critical loop error: {e}"
+            print(msg)
+            send_telegram(f"🚨 <b>Critical Error</b>\n{msg}")
+            time.sleep(30)
 
-    print("Rendering ...")
-    img = plot_chart(df_1m, bucket_profiles, w, market)
-
-    closed = w["closed_bucket_bounds"]
-    last_closed = closed[-1][0] if closed else None
-    if last_closed in bucket_profiles:
-        vp = bucket_profiles[last_closed]
-        caption = (
-            f"{market} | 1m Candles + {HTF_INTERVAL} Volume Profile (VA {int(VALUE_AREA_PCT*100)}%)\n"
-            f"Covering {len(bucket_profiles)} closed buckets, last: {last_closed.strftime('%H:%M')} UTC\n"
-            f"POC {vp['poc_price']:.1f} | VAH {vp['vah']:.1f} | VAL {vp['val']:.1f}"
-        )
-    else:
-        caption = f"{market} | 1m Candles + {HTF_INTERVAL} Volume Profile"
-
-    send_telegram(img, caption)
-    print("Done.")
+        wait_until_next_cycle()
 
 
 if __name__ == "__main__":
