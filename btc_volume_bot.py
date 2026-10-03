@@ -11,7 +11,7 @@
     • Sends Heartbeat
     • Reports any errors that occurred in the cycle
 - Fully self-healing with retries
-"""
+""" 
 
 import time
 import traceback
